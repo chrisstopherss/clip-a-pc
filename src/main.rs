@@ -2,6 +2,7 @@
 
 mod config;
 mod h264;
+mod mixer;
 mod mp4;
 mod ring;
 
