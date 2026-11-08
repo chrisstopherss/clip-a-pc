@@ -7,6 +7,9 @@ description = "Small background clipper for Windows"
 
 [dependencies]
 
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
@@ -31,14 +34,15 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Ole",
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Variant",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
 ]
-
-[target.'cfg(windows)'.dev-dependencies]
-wasapi = "0.27"
 
 [profile.release]
 opt-level = 3

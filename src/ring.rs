@@ -59,6 +59,19 @@ impl Ring {
         }
     }
 
+    /// Seconds of video currently buffered.
+    pub fn span_secs(&self) -> f64 {
+        let v = |e: &&Entry| e.track == Track::Video;
+        match (self.entries.iter().find(v), self.entries.iter().rev().find(v)) {
+            (Some(a), Some(b)) => (b.pts - a.pts) as f64 / 1e7,
+            _ => 0.0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

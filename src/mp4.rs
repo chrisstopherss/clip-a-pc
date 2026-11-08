@@ -13,6 +13,7 @@ const VIDEO_TIMESCALE: u32 = 90_000;
 const MOVIE_TIMESCALE: u32 = 1000;
 const AAC_FRAME_SAMPLES: u32 = 1024;
 
+#[derive(Clone)]
 pub struct VideoParams {
     pub width: u32,
     pub height: u32,
@@ -21,6 +22,7 @@ pub struct VideoParams {
     pub pps: Vec<u8>,
 }
 
+#[derive(Clone)]
 pub struct AudioParams {
     pub sample_rate: u32,
     pub channels: u16,

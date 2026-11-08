@@ -19,6 +19,12 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release
+      - name: Upload app
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clip-a-pc
+          path: target/release/clip-a-pc.exe
       - name: Build spikes
         if: runner.os == 'Windows'
         run: cargo build --release --examples

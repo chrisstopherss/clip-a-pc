@@ -6,4 +6,12 @@ mod mixer;
 mod mp4;
 mod ring;
 
-fn main() {}
+#[cfg(windows)]
+mod win;
+
+fn main() {
+    #[cfg(windows)]
+    win::app::run();
+    #[cfg(not(windows))]
+    println!("clip-a-pc only runs on Windows");
+}
