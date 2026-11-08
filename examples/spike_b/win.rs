@@ -16,6 +16,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::mixer::{Mixer, FRAME, RATE};
+use std::collections::VecDeque;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -145,6 +146,55 @@ fn drain(c: &Capture, mixer: &mut Mixer, src: usize, st: &mut SecondStats) -> Re
             mixer.push(src, qpc as i64, &samples);
         }
     }
+}
+
+
+// ------------------------------------------------- system-wide audio (process loopback)
+
+/// Everything every app plays except this program, tapped before it reaches any
+/// device, so it does not matter which output the apps use or how it is routed.
+struct SysLoop {
+    _client: wasapi::AudioClient,
+    cap: wasapi::AudioCaptureClient,
+    _event: wasapi::Handle,
+    bytes: VecDeque<u8>,
+}
+
+fn open_system_loopback() -> Res<SysLoop> {
+    use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat};
+    wasapi::initialize_mta().ok()?;
+    let fmt = WaveFormat::new(32, 32, SampleType::Float, RATE as usize, 2, None);
+    let mut client = AudioClient::new_application_loopback_client(std::process::id(), false)?;
+    client.initialize_client(
+        &fmt,
+        Direction::Capture,
+        StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 200_000 },
+        None,
+    )?;
+    let event = client.set_get_eventhandle()?;
+    let cap = client.get_audiocaptureclient()?;
+    client.start_stream()?;
+    Ok(SysLoop { _client: client, cap, _event: event, bytes: VecDeque::new() })
+}
+
+fn drain_system(s: &mut SysLoop, mixer: &mut Mixer, st: &mut SecondStats) -> Res<()> {
+    while s.cap.get_next_packet_size()?.unwrap_or(0) > 0 {
+        s.bytes.clear();
+        let info = s.cap.read_from_device_to_deque(&mut s.bytes)?;
+        let raw: Vec<u8> = s.bytes.iter().copied().collect();
+        let samples: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        if info.flags.silent {
+            st.silent_flags += 1;
+        }
+        if info.flags.data_discontinuity {
+            st.discontinuities += 1;
+        }
+        st.packets += 1;
+        st.frames += samples.len() as u64 / 2;
+        st.peak = samples.iter().fold(st.peak, |p, v| p.max(v.abs()));
+        mixer.push(LOOPBACK, info.timestamp as i64, &samples);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- AAC
@@ -399,7 +449,8 @@ fn real_main() -> Res<()> {
         }
         return scan(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10));
     }
-    let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let system_mode = args.iter().any(|a| a == "--system");
+    let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).or_else(|| args.get(2).and_then(|s| s.parse().ok())).unwrap_or(15);
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
@@ -407,14 +458,26 @@ fn real_main() -> Res<()> {
     }
     let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
-    let mut loopback = match open_capture(&en, true) {
-        Ok(c) => {
-            println!("desktop audio (loopback): {}", c.name);
-            Some(c)
+    let mut sys: Option<SysLoop> = None;
+    let mut loopback = if system_mode {
+        match open_system_loopback() {
+            Ok(s) => {
+                println!("desktop audio: ALL apps except this program (process loopback, device independent)");
+                sys = Some(s);
+            }
+            Err(e) => println!("system-wide desktop audio FAILED to open: {e}"),
         }
-        Err(e) => {
-            println!("desktop audio FAILED to open: {e}");
-            None
+        None
+    } else {
+        match open_capture(&en, true) {
+            Ok(c) => {
+                println!("desktop audio (loopback): {}", c.name);
+                Some(c)
+            }
+            Err(e) => {
+                println!("desktop audio FAILED to open: {e}");
+                None
+            }
         }
     };
     let mut mic = match open_capture(&en, false) {
@@ -434,6 +497,10 @@ fn real_main() -> Res<()> {
     println!("and if you can, switch your default output or mic device in Windows sound settings.\n");
 
     let mut mixer = Mixer::new(2);
+    if let Some(g) = args.iter().position(|a| a == "--mic-gain").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f32>().ok()) {
+        mixer.set_gain(MIC, g);
+        println!("mic gain set to {g}x");
+    }
     let mut pcm_all: Vec<i16> = Vec::new();
     let (mut ls, mut ms) = (SecondStats::default(), SecondStats::default());
     let mut mix_peak = 0f32;
@@ -450,6 +517,9 @@ fn real_main() -> Res<()> {
         if last_poll.elapsed() >= Duration::from_millis(500) {
             last_poll = Instant::now();
             for (render, slot, label) in [(true, &mut loopback, "desktop audio"), (false, &mut mic, "microphone")] {
+                if render && system_mode {
+                    continue;
+                }
                 let now_id = default_id(&en, render);
                 let have = slot.as_ref().map(|c| c.id.clone());
                 if now_id != have {
@@ -470,6 +540,9 @@ fn real_main() -> Res<()> {
 
         if let Some(c) = &loopback {
             drain(c, &mut mixer, LOOPBACK, &mut ls)?;
+        }
+        if let Some(sl) = sys.as_mut() {
+            drain_system(sl, &mut mixer, &mut ls)?;
         }
         if let Some(c) = &mic {
             drain(c, &mut mixer, MIC, &mut ms)?;

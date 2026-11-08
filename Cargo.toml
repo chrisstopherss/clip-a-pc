@@ -37,6 +37,9 @@ features = [
     "Win32_System_WinRT_Graphics_Capture",
 ]
 
+[target.'cfg(windows)'.dev-dependencies]
+wasapi = "0.27"
+
 [profile.release]
 opt-level = 3
 lto = true
