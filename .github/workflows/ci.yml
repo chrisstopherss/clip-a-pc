@@ -16,3 +16,12 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release
+      - name: Build spike
+        if: runner.os == 'Windows'
+        run: cargo build --release --example spike_a
+      - name: Upload spike
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike_a
+          path: target/release/examples/spike_a.exe
