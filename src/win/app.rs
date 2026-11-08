@@ -1,120 +1,363 @@
-//! Console front end for the recorder: start it, press Alt+C to save a clip.
+//! The tray app: a hidden window that owns the tray icon and the Alt+C hotkey,
+//! starts the recorder, and shows the settings window when asked.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT};
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT};
+use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::engine::{Engine, EngineCfg};
-use super::util::{cpu_seconds, memory_mb};
+use super::log::{log, log_path, trim};
+use super::settings_ui::{self, Pending, PENDING, SETTINGS_HWND, WM_APP_QUIT, WM_APP_SETTINGS_DONE};
+use super::store::{autostart_enabled, load_config, save_config, set_autostart};
+use super::toast;
+use super::util::{memory_mb, videos_dir};
 use super::video::list_monitors;
-use crate::config::{nearest_duration, DEFAULT_DURATION_SECS};
+use crate::config::Config;
+
+const WM_TRAY: u32 = WM_APP + 1;
+const ID_SAVE: usize = 1001;
+const ID_SETTINGS: usize = 1002;
+const ID_FOLDER: usize = 1003;
+const ID_LOG: usize = 1004;
+const ID_QUIT: usize = 1005;
+const HOTKEY_ID: i32 = 1;
+
+struct State {
+    engine: Option<Arc<Engine>>,
+    cfg: Config,
+}
+
+static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+static SAVING: AtomicBool = AtomicBool::new(false);
+static FIRST_RUN: AtomicBool = AtomicBool::new(false);
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+static ICON: AtomicIsize = AtomicIsize::new(0);
+
+fn state() -> &'static Mutex<State> {
+    STATE.get_or_init(|| Mutex::new(State { engine: None, cfg: Config::default() }))
+}
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
-fn save_and_report(engine: &Engine) {
-    let (p0, w0) = memory_mb();
-    let t = Instant::now();
-    match engine.save() {
-        Ok(s) => {
-            let (p1, w1) = memory_mb();
-            println!(
-                "\nCLIP SAVED  {}\n  {:.1} s, {:.1} MB, written in {} ms\n  memory: private {p0:.0} -> {p1:.0} MB, working set {w0:.0} -> {w1:.0} MB\n",
-                s.path.display(),
-                s.seconds,
-                s.bytes as f64 / 1048576.0,
-                t.elapsed().as_millis()
-            );
+// ------------------------------------------------------------------ engine
+
+fn start_engine(cfg: &Config) -> Option<Arc<Engine>> {
+    let monitors = list_monitors();
+    let idx = monitors.iter().position(|m| m.device_name == cfg.monitor).unwrap_or(0);
+    match Engine::start(EngineCfg { secs: cfg.duration_secs, monitor: idx, mic_gain: cfg.mic_gain }) {
+        Ok(e) => {
+            let e = Arc::new(e);
+            log(&format!("recording started: {} s clips, monitor {idx}, mic {}x", cfg.duration_secs, cfg.mic_gain));
+            let watcher = e.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(3));
+                log(&format!("video: {}", watcher.shared.video_info.lock().unwrap()));
+                log(&format!("audio: {}", watcher.shared.audio_info.lock().unwrap()));
+                // one status line every 5 minutes while this engine runs
+                loop {
+                    for _ in 0..300 {
+                        if watcher.is_stopped() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    let (span, used) = watcher.buffer_status();
+                    let (p, w) = memory_mb();
+                    log(&format!("status: buffered {span:.0} s ({:.0} MB), memory private {p:.0} MB, working set {w:.0} MB", used as f64 / 1048576.0));
+                }
+            });
+            Some(e)
         }
-        Err(e) => println!("\nsave failed: {e}\n"),
+        Err(e) => {
+            log(&format!("could not start recording: {e}"));
+            toast::notify("clip-a-pc could not start recording", &e.to_string());
+            None
+        }
     }
 }
 
-pub fn run() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--list") {
-        for (i, m) in list_monitors().iter().enumerate() {
-            println!("monitor {i}: {}x{} {}{}", m.width, m.height, m.device_name, if m.primary { " (primary)" } else { "" });
-        }
+fn restart_engine(cfg: Config) {
+    let old = {
+        let mut st = state().lock().unwrap();
+        st.cfg = cfg.clone();
+        st.engine.take()
+    };
+    if let Some(e) = old {
+        e.stop();
+    }
+    let new = start_engine(&cfg);
+    state().lock().unwrap().engine = new;
+}
+
+fn save_clip() {
+    if SAVING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let secs = nearest_duration(arg_value(&args, "--secs").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_DURATION_SECS));
-    let monitor = arg_value(&args, "--monitor").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let mic_gain = arg_value(&args, "--mic-gain").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let autosave: Option<u64> = arg_value(&args, "--autosave").and_then(|v| v.parse().ok());
+    let engine = state().lock().unwrap().engine.clone();
+    let Some(engine) = engine else {
+        SAVING.store(false, Ordering::SeqCst);
+        toast::notify("Nothing to save", "Recording is not running.");
+        return;
+    };
+    std::thread::spawn(move || {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let t = Instant::now();
+        let (p0, _) = memory_mb();
+        match engine.save() {
+            Ok(s) => {
+                toast::chime();
+                let name = s.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                toast::notify("Clip saved", &format!("{:.0} s, {:.1} MB  ({name})", s.seconds, s.bytes as f64 / 1048576.0));
+                let (p1, w1) = memory_mb();
+                log(&format!(
+                    "clip saved: {} ({:.1} s, {:.1} MB) in {} ms, private memory {p0:.0} -> {p1:.0} MB, working set {w1:.0} MB",
+                    s.path.display(),
+                    s.seconds,
+                    s.bytes as f64 / 1048576.0,
+                    t.elapsed().as_millis()
+                ));
+            }
+            Err(e) => {
+                toast::notify("Could not save the clip", &e.to_string());
+                log(&format!("save failed: {e}"));
+            }
+        }
+        SAVING.store(false, Ordering::SeqCst);
+    });
+}
 
-    let (p, w) = memory_mb();
-    println!("clip-a-pc starting. clip length {secs} s, monitor {monitor}, mic gain {mic_gain}x");
-    println!("memory at start: private {p:.0} MB, working set {w:.0} MB");
-    let engine = match Engine::start(EngineCfg { secs, monitor, mic_gain }) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
-            eprintln!("could not start: {e}");
+// ------------------------------------------------------------------ tray
+
+/// A red record dot, drawn at runtime so the exe needs no icon file.
+unsafe fn make_icon() -> HICON {
+    const N: i32 = 32;
+    let mut px = vec![0u8; (N * N * 4) as usize];
+    for y in 0..N {
+        for x in 0..N {
+            let (dx, dy) = (x as f32 + 0.5 - N as f32 / 2.0, y as f32 + 0.5 - N as f32 / 2.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            let alpha = (13.5 - d).clamp(0.0, 1.0);
+            let white = (5.0 - d).clamp(0.0, 1.0);
+            let (r, g, b) = (229.0 * (1.0 - white) + 255.0 * white, 57.0 * (1.0 - white) + 255.0 * white, 53.0 * (1.0 - white) + 255.0 * white);
+            let i = ((y * N + x) * 4) as usize;
+            // premultiplied BGRA
+            px[i] = (b * alpha) as u8;
+            px[i + 1] = (g * alpha) as u8;
+            px[i + 2] = (r * alpha) as u8;
+            px[i + 3] = (alpha * 255.0) as u8;
+        }
+    }
+    let mask = vec![0u8; (N * N / 8) as usize];
+    let color = CreateBitmap(N, N, 1, 32, Some(px.as_ptr() as *const _));
+    let mono = CreateBitmap(N, N, 1, 1, Some(mask.as_ptr() as *const _));
+    let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mono, hbmColor: color };
+    let icon = CreateIconIndirect(&info).unwrap_or_default();
+    let _ = DeleteObject(color.into());
+    let _ = DeleteObject(mono.into());
+    icon
+}
+
+unsafe fn tray_add(hwnd: HWND) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uCallbackMessage: WM_TRAY,
+        hIcon: HICON(ICON.load(Ordering::Relaxed) as *mut _),
+        ..Default::default()
+    };
+    for (i, u) in "clip-a-pc  (Alt+C saves a clip)".encode_utf16().take(127).enumerate() {
+        nid.szTip[i] = u;
+    }
+    let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+unsafe fn tray_remove(hwnd: HWND) {
+    let nid = NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() };
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+fn open_path(hwnd: HWND, path: &std::path::Path) {
+    unsafe {
+        ShellExecuteW(Some(hwnd), w!("open"), &HSTRING::from(path.as_os_str()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+fn open_settings(hwnd: HWND) {
+    let cfg = state().lock().unwrap().cfg.clone();
+    settings_ui::open(hwnd, false, cfg, autostart_enabled());
+}
+
+unsafe fn show_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let _ = AppendMenuW(menu, MF_STRING, ID_SAVE, w!("Save clip now"));
+    let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
+    let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open clips folder"));
+    let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    match cmd.0 as usize {
+        ID_SAVE => save_clip(),
+        ID_SETTINGS => open_settings(hwnd),
+        ID_FOLDER => {
+            let dir = videos_dir().join("clip-a-pc");
+            let _ = std::fs::create_dir_all(&dir);
+            open_path(hwnd, &dir);
+        }
+        ID_LOG => open_path(hwnd, &log_path()),
+        ID_QUIT => {
+            let _ = DestroyWindow(hwnd);
+        }
+        _ => {}
+    }
+}
+
+fn apply_pending(hwnd: HWND) {
+    let Some(Pending { cfg, autostart }) = PENDING.lock().unwrap().take() else { return };
+    if let Err(e) = save_config(&cfg) {
+        log(&format!("could not save settings: {e}"));
+    }
+    set_autostart(autostart);
+    restart_engine(cfg);
+    if FIRST_RUN.swap(false, Ordering::SeqCst) {
+        toast::notify("clip-a-pc is running", "Press Alt+C any time to save a clip.");
+    }
+    let _ = hwnd;
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_HOTKEY => {
+            save_clip();
+            LRESULT(0)
+        }
+        WM_TRAY => {
+            match (lp.0 as u32) & 0xFFFF {
+                x if x == WM_RBUTTONUP || x == WM_CONTEXTMENU => show_menu(hwnd),
+                x if x == WM_LBUTTONDBLCLK => open_settings(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_APP_SETTINGS_DONE => {
+            apply_pending(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_QUIT => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            tray_remove(hwnd);
+            let engine = state().lock().unwrap().engine.take();
+            if let Some(e) = engine {
+                e.stop();
+            }
+            log("clip-a-pc closed");
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            tray_add(hwnd); // Explorer restarted
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// ------------------------------------------------------------------ entry
+
+pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // one copy at a time
+        let _mutex = CreateMutexW(None, true, w!("Local\\clip-a-pc-single-instance"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            MessageBoxW(None, w!("clip-a-pc is already running. Look for its icon near the clock."), w!("clip-a-pc"), MB_OK | MB_ICONINFORMATION);
             return;
         }
-    };
+        trim();
+        std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
+        log("clip-a-pc started");
+        toast::register();
 
-    std::thread::sleep(Duration::from_millis(1500));
-    println!("video: {}", engine.shared.video_info.lock().unwrap());
-    println!("audio: {}", engine.shared.audio_info.lock().unwrap());
-    println!("ring buffer: {:.0} MB for {} s (+{} s so a clip can start on a keyframe)", engine.ring_capacity as f64 / 1048576.0, secs, 2);
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        ICON.store(make_icon().0 as isize, Ordering::Relaxed);
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+        let class = w!("ClipAPCMain");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinst.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        let Ok(hwnd) = CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("clip-a-pc"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, Some(hinst.into()), None) else {
+            log("could not create the main window");
+            return;
+        };
+        tray_add(hwnd);
 
-    // status line every 10 s
-    {
-        let engine = engine.clone();
-        std::thread::spawn(move || {
-            let (mut last_cpu, mut last_t) = (cpu_seconds(), Instant::now());
-            loop {
-                std::thread::sleep(Duration::from_secs(10));
-                let (span, used) = engine.buffer_status();
-                let (p, w) = memory_mb();
-                let cpu = cpu_seconds();
-                let pct = (cpu - last_cpu) / last_t.elapsed().as_secs_f64() * 100.0;
-                last_cpu = cpu;
-                last_t = Instant::now();
-                println!(
-                    "[status] buffered {span:.0} s ({:.0} MB) | memory private {p:.0} MB, working set {w:.0} MB | cpu {pct:.1}% of one core | frames {}",
-                    used as f64 / 1048576.0,
-                    engine.frames.load(Ordering::Relaxed)
-                );
-            }
-        });
-    }
-
-    if let Some(after) = autosave {
-        let engine = engine.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(after));
-            save_and_report(&engine);
-            std::process::exit(0);
-        });
-        println!("will save one clip after {after} s and exit");
-    }
-
-    let hotkey_ok = unsafe { RegisterHotKey(None, 1, MOD_ALT | MOD_NOREPEAT, 'C' as u32).is_ok() };
-    if hotkey_ok {
-        println!("\nReady. Press Alt+C to save the last {secs} s. Ctrl+C here to quit.\n");
-    } else {
-        println!("\nCould not register Alt+C (another program already uses it). Use --autosave N instead.\n");
-    }
-
-    let saving = Arc::new(AtomicBool::new(false));
-    let mut msg = MSG::default();
-    loop {
-        let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if r.0 <= 0 {
-            break;
+        if RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, 'C' as u32).is_err() {
+            log("could not register Alt+C: another program already uses it");
+            toast::notify("Alt+C is already in use", "Another program has this shortcut, so clip-a-pc cannot use it.");
         }
-        if msg.message == WM_HOTKEY && !saving.swap(true, Ordering::SeqCst) {
-            let (engine, saving) = (engine.clone(), saving.clone());
+
+        match load_config() {
+            Some(cfg) => {
+                state().lock().unwrap().cfg = cfg.clone();
+                let e = start_engine(&cfg);
+                state().lock().unwrap().engine = e;
+            }
+            None => {
+                FIRST_RUN.store(true, Ordering::SeqCst);
+                settings_ui::open(hwnd, true, Config::default(), false);
+            }
+        }
+
+        // test helper: save one clip after N seconds, then quit
+        if let Some(after) = arg_value(&args, "--autosave").and_then(|v| v.parse::<u64>().ok()) {
+            let hw = hwnd.0 as isize;
             std::thread::spawn(move || {
-                save_and_report(&engine);
-                saving.store(false, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(after));
+                save_clip();
+                std::thread::sleep(Duration::from_secs(4));
+                let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_QUIT, WPARAM(0), LPARAM(0));
             });
+        }
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let sw = SETTINGS_HWND.load(Ordering::SeqCst);
+            if sw != 0 && IsDialogMessageW(HWND(sw as *mut _), &msg).as_bool() {
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 }

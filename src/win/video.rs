@@ -89,6 +89,8 @@ pub struct Pipeline {
     nv12: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     enc: MftEncoder,
     _mgr: IMFDXGIDeviceManager,
+    lost: Arc<AtomicBool>,
+    src_size: (u32, u32),
     pub out_w: u32,
     pub out_h: u32,
     pub adapter: String,
@@ -138,6 +140,14 @@ impl Pipeline {
         let session = pool.CreateCaptureSession(&item)?;
         let _ = session.SetIsCursorCaptureEnabled(true);
         let _ = session.SetIsBorderRequired(false);
+        let lost = Arc::new(AtomicBool::new(false));
+        {
+            let lost = lost.clone();
+            item.Closed(&TypedEventHandler::new(move |_: windows::core::Ref<GraphicsCaptureItem>, _| {
+                lost.store(true, Ordering::Relaxed);
+                Ok(())
+            }))?;
+        }
         let latest: Arc<Mutex<Option<Direct3D11CaptureFrame>>> = Arc::new(Mutex::new(None));
         {
             let latest = latest.clone();
@@ -219,7 +229,7 @@ impl Pipeline {
             .ok_or("no hardware H.264 encoder found")?;
         let enc = MftEncoder::new(act, name.clone(), &mgr, out_w, out_h, FPS, MEAN_BPS, MAX_BPS)?;
 
-        Ok(Self { latest, session, pool, vdev, vctx, venum, vproc, nv12, enc, _mgr: mgr, out_w, out_h, adapter, encoder: name.clone(), dropped: 0 })
+        Ok(Self { latest, session, pool, vdev, vctx, venum, vproc, nv12, enc, _mgr: mgr, lost, src_size: (src_w, src_h), out_w, out_h, adapter, encoder: name.clone(), dropped: 0 })
     }
 
     pub fn has_frame(&self) -> bool {
@@ -228,10 +238,17 @@ impl Pipeline {
 
     /// Convert the newest captured frame and give it to the encoder.
     pub fn submit(&mut self, n: u64, pts: i64) -> Res<()> {
+        if self.lost.load(Ordering::Relaxed) {
+            return Err("the captured screen went away (display change or sleep)".into());
+        }
         let (tex, ov) = &self.nv12[n as usize % POOL];
         {
             let guard = self.latest.lock().unwrap();
             let frame = guard.as_ref().ok_or("no captured frame")?;
+            let cs = frame.ContentSize()?;
+            if (cs.Width as u32, cs.Height as u32) != self.src_size {
+                return Err("screen resolution changed".into());
+            }
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let src: ID3D11Texture2D = unsafe { access.GetInterface()? };
@@ -273,13 +290,16 @@ impl Pipeline {
     }
 }
 
-/// Runs until `stop` is set. Packets go to the ring through `tx`.
-pub fn run(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
+fn run_once(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
     let mut pipe = Pipeline::new(monitor)?;
     *shared.video_info.lock().unwrap() = format!("{} on {} ({}x{} at {} fps)", pipe.encoder, pipe.adapter, pipe.out_w, pipe.out_h, FPS);
 
     let wait = Instant::now();
     while !pipe.has_frame() {
+        if stop.load(Ordering::Relaxed) {
+            pipe.close();
+            return Ok(());
+        }
         if wait.elapsed() > Duration::from_secs(5) {
             return Err("no frame from screen capture within 5 s".into());
         }
@@ -321,5 +341,31 @@ pub fn run(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<Atomi
     }
     shared.dropped_video.store(pipe.dropped, Ordering::Relaxed);
     pipe.close();
+    Ok(())
+}
+
+/// Runs until `stop` is set. If capture fails (display change, GPU reset, sleep)
+/// it clears the buffer, waits a moment and starts again.
+pub fn run(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
+    let mut last_err = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        match run_once(monitor, tx.clone(), shared.clone(), stop.clone(), frames.clone()) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg != last_err {
+                    super::log::log(&format!("video capture error, restarting: {msg}"));
+                    last_err = msg;
+                }
+                let _ = tx.send(Msg::Reset);
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
     Ok(())
 }

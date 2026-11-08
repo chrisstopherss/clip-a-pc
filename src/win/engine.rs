@@ -31,6 +31,8 @@ const EXTRA_SECS: u32 = 2;
 pub enum Msg {
     Video { pts: i64, key: bool, data: Vec<u8> },
     Audio { pts: i64, data: Vec<u8> },
+    /// The picture source was rebuilt: drop everything buffered so far.
+    Reset,
 }
 
 #[derive(Default)]
@@ -58,7 +60,7 @@ pub struct Engine {
     ring: Arc<Mutex<Ring>>,
     pub shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
     pub frames: Arc<AtomicU64>,
     pub secs: u32,
     pub ring_capacity: usize,
@@ -80,7 +82,7 @@ impl Engine {
         let mut threads = Vec::new();
 
         {
-            let (ring, stop) = (ring.clone(), stop.clone());
+            let (ring, stop, shared) = (ring.clone(), stop.clone(), shared.clone());
             threads.push(std::thread::spawn(move || loop {
                 match rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(m) => {
@@ -88,6 +90,11 @@ impl Engine {
                         match m {
                             Msg::Video { pts, key, data } => r.push(Track::Video, pts, key, &data),
                             Msg::Audio { pts, data } => r.push(Track::Audio, pts, false, &data),
+                            Msg::Reset => {
+                                r.clear();
+                                *shared.video.lock().unwrap() = None;
+                                true
+                            }
                         };
                     }
                     Err(RecvTimeoutError::Timeout) => {
@@ -105,7 +112,7 @@ impl Engine {
             threads.push(std::thread::spawn(move || {
                 unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
                 if let Err(e) = super::video::run(monitor, tx, shared, stop, frames) {
-                    eprintln!("video capture stopped: {e}");
+                    super::log::log(&format!("video capture stopped for good: {e}"));
                 }
             }));
         }
@@ -114,11 +121,11 @@ impl Engine {
             let gain = cfg.mic_gain;
             threads.push(std::thread::spawn(move || {
                 if let Err(e) = super::audio::run(tx, shared, stop, gain) {
-                    eprintln!("audio capture stopped: {e}");
+                    super::log::log(&format!("audio capture stopped for good: {e}"));
                 }
             }));
         }
-        Ok(Engine { ring, shared, stop, threads, frames, secs: cfg.secs, ring_capacity: capacity })
+        Ok(Engine { ring, shared, stop, threads: Mutex::new(threads), frames, secs: cfg.secs, ring_capacity: capacity })
     }
 
     /// (buffered seconds of video, bytes used)
@@ -152,9 +159,14 @@ impl Engine {
         Ok(Saved { path: fin, seconds, bytes })
     }
 
-    pub fn stop(self) {
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        for t in self.threads {
+        let threads: Vec<_> = self.threads.lock().unwrap().drain(..).collect();
+        for t in threads {
             let _ = t.join();
         }
     }

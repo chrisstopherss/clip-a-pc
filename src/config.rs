@@ -15,6 +15,65 @@ pub fn nearest_duration(secs: u32) -> u32 {
     best
 }
 
+/// Microphone volume choices shown in settings.
+pub const MIC_GAINS: [f32; 6] = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0];
+
+/// Everything the user can change. Stored as plain `key = value` lines.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub duration_secs: u32,
+    /// Windows device name of the monitor to record, such as `\\.\DISPLAY1`.
+    /// Empty means the primary monitor.
+    pub monitor: String,
+    pub mic_gain: f32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { duration_secs: DEFAULT_DURATION_SECS, monitor: String::new(), mic_gain: 1.0 }
+    }
+}
+
+impl Config {
+    /// Read settings from text. Unknown lines and bad values are ignored, so a
+    /// hand-edited file can never stop the program from starting.
+    pub fn parse(text: &str) -> Self {
+        let mut c = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            match k {
+                "clip_seconds" => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        c.duration_secs = nearest_duration(n);
+                    }
+                }
+                "monitor" => c.monitor = v.to_string(),
+                "mic_volume" => {
+                    if let Ok(g) = v.parse::<f32>() {
+                        if g.is_finite() {
+                            c.mic_gain = g.clamp(0.0, 8.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        c
+    }
+
+    pub fn to_text(&self) -> String {
+        format!(
+            "# clip-a-pc settings\nclip_seconds = {}\nmonitor = {}\nmic_volume = {}\n",
+            self.duration_secs, self.monitor, self.mic_gain
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +96,30 @@ mod tests {
         assert_eq!(nearest_duration(40), 45);
         assert_eq!(nearest_duration(75), 60);
         assert_eq!(nearest_duration(1000), 120);
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let c = Config { duration_secs: 90, monitor: "\\\\.\\DISPLAY2".into(), mic_gain: 2.0 };
+        assert_eq!(Config::parse(&c.to_text()), c);
+    }
+
+    #[test]
+    fn empty_or_garbage_gives_defaults() {
+        assert_eq!(Config::parse(""), Config::default());
+        assert_eq!(Config::parse("not a setting\n=\n###\nclip_seconds = abc\nmic_volume = nan"), Config::default());
+    }
+
+    #[test]
+    fn hand_edited_values_are_fixed_up() {
+        let c = Config::parse("clip_seconds = 40\nmic_volume = 99\n");
+        assert_eq!(c.duration_secs, 45);
+        assert_eq!(c.mic_gain, 8.0);
+        assert_eq!(Config::parse("mic_volume = -3").mic_gain, 0.0);
+    }
+
+    #[test]
+    fn mic_gains_are_sane() {
+        assert!(MIC_GAINS.contains(&1.0));
     }
 }

@@ -7,6 +7,9 @@ description = "Small background clipper for Windows"
 
 [dependencies]
 
+[build-dependencies]
+embed-manifest = "1"
+
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.27"
 
@@ -14,6 +17,12 @@ wasapi = "0.27"
 version = "0.62"
 features = [
     "Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_System_Registry",
+    "UI_Notifications",
+    "Data_Xml_Dom",
     "Graphics_Capture",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",

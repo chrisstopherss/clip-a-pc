@@ -251,7 +251,7 @@ impl Aac {
 
 // ------------------------------------------------------------------ main loop
 
-pub fn run(tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, mic_gain: f32) -> Res<()> {
+fn run_once(tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, mic_gain: f32) -> Res<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
@@ -337,6 +337,30 @@ pub fn run(tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, mic_gain
                 let pts_k = base + out_frames as i64 * FRAME as i64 * 10_000_000 / RATE;
                 out_frames += 1;
                 let _ = tx.send(Msg::Audio { pts: pts_k, data });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs until `stop` is set, starting over after an error.
+pub fn run(tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, mic_gain: f32) -> Res<()> {
+    let mut last_err = String::new();
+    while !stop.load(Ordering::Relaxed) {
+        match run_once(tx.clone(), shared.clone(), stop.clone(), mic_gain) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg != last_err {
+                    super::log::log(&format!("audio error, restarting: {msg}"));
+                    last_err = msg;
+                }
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
