@@ -77,7 +77,13 @@ fn process_stats() -> (f64, f64, f64) {
     }
 }
 
-fn list_hw_h264_encoders() -> Res<()> {
+fn mark(label: &str) {
+    let (p, ws, _) = process_stats();
+    println!("  [mem] {label:<38} private {p:>6.1} MB  ws {ws:>6.1} MB");
+}
+
+fn list_hw_h264_encoders() -> Res<Vec<(IMFActivate, String)>> {
+    let mut found: Vec<(IMFActivate, String)> = Vec::new();
     unsafe {
         let out_type = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
@@ -102,8 +108,10 @@ fn list_hw_h264_encoders() -> Res<()> {
                     .GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut name, &mut len)
                     .is_ok()
                 {
-                    println!("  - {}", name.to_string().unwrap_or_default());
+                    let n = name.to_string().unwrap_or_default();
+                    println!("  - {n}");
                     CoTaskMemFree(Some(name.0 as *const _));
+                    found.push((act.clone(), n));
                 }
             }
         }
@@ -112,13 +120,14 @@ fn list_hw_h264_encoders() -> Res<()> {
         }
         CoTaskMemFree(Some(activates as *const _));
     }
-    Ok(())
+    Ok(found)
 }
 
 fn real_main() -> Res<()> {
     let args: Vec<String> = std::env::args().collect();
     let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
     let path = args.get(2).cloned().unwrap_or_else(|| "spike_a.mp4".into());
+    let mft_mode = args.iter().any(|a| a == "--mft");
 
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
@@ -127,7 +136,8 @@ fn real_main() -> Res<()> {
     }
     let (base_private, base_ws, _) = process_stats();
     println!("memory before anything: private {base_private:.1} MB, working set {base_ws:.1} MB");
-    list_hw_h264_encoders()?;
+    let encoders = list_hw_h264_encoders()?;
+    mark("after MFTEnumEx");
 
     // D3D11 device
     let mut device: Option<ID3D11Device> = None;
@@ -146,6 +156,7 @@ fn real_main() -> Res<()> {
         )?;
     }
     let device = device.ok_or("no D3D11 device")?;
+    mark("after D3D11 device");
     let ctx = ctx.ok_or("no D3D11 context")?;
     unsafe {
         let mt: ID3D11Multithread = device.cast()?;
@@ -211,6 +222,7 @@ fn real_main() -> Res<()> {
         ))?;
     }
     session.StartCapture()?;
+    mark("after capture session started");
 
     // GPU scaler / color converter
     let vdev: ID3D11VideoDevice = device.cast()?;
@@ -240,6 +252,7 @@ fn real_main() -> Res<()> {
         vctx.VideoProcessorSetOutputColorSpace(&vproc, &out_cs);
     }
 
+    mark("after video processor");
     // NV12 texture pool
     let tex_desc = D3D11_TEXTURE2D_DESC {
         Width: out_w,
@@ -267,6 +280,7 @@ fn real_main() -> Res<()> {
         nv12.push((t, ov.ok_or("output view failed")?));
     }
 
+    mark("after NV12 texture pool");
     // Media Foundation sink writer, hardware encoder, D3D11 input
     let mut token = 0u32;
     let mut mgr: Option<IMFDXGIDeviceManager> = None;
@@ -284,9 +298,14 @@ fn real_main() -> Res<()> {
         attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &mgr)?;
         attrs.SetUINT32(&MF_LOW_LATENCY, 1)?;
     }
-    let writer = unsafe { MFCreateSinkWriterFromURL(&HSTRING::from(path.as_str()), None, &attrs)? };
+    let writer: Option<IMFSinkWriter> = if mft_mode {
+        None
+    } else {
+        Some(unsafe { MFCreateSinkWriterFromURL(&HSTRING::from(path.as_str()), None, &attrs)? })
+    };
 
-    unsafe {
+    if let Some(writer) = &writer {
+      unsafe {
         let out_t = MFCreateMediaType()?;
         out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         out_t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
@@ -311,7 +330,20 @@ fn real_main() -> Res<()> {
         in_t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
         writer.SetInputMediaType(stream, &in_t, None)?;
         writer.BeginWriting()?;
+      }
     }
+
+    let mut enc: Option<crate::mft::MftEncoder> = None;
+    if mft_mode {
+        let (act, name) = encoders
+            .iter()
+            .find(|(_, n)| n.contains("NVIDIA"))
+            .or_else(|| encoders.first())
+            .ok_or("no hardware H.264 encoder")?;
+        println!("driving encoder directly: {name}");
+        enc = Some(crate::mft::MftEncoder::new(act, name.clone(), &mgr, out_w, out_h, FPS, 5_000_000, 8_000_000)?);
+    }
+    mark("after encoder created");
 
     // wait for the first captured frame
     let wait = Instant::now();
@@ -376,7 +408,11 @@ fn real_main() -> Res<()> {
             sample.AddBuffer(&buf)?;
             sample.SetSampleTime(n as i64 * FRAME_100NS)?;
             sample.SetSampleDuration(FRAME_100NS)?;
-            writer.WriteSample(0, &sample)?;
+            if let Some(w) = &writer {
+                w.WriteSample(0, &sample)?;
+            } else if let Some(e) = enc.as_mut() {
+                e.feed(&sample)?;
+            }
         }
         slowest_ms = slowest_ms.max(t0.elapsed().as_secs_f64() * 1000.0);
 
@@ -398,11 +434,19 @@ fn real_main() -> Res<()> {
     }
 
     let wall = start.elapsed().as_secs_f64();
-    unsafe { writer.Finalize()? };
+    if let Some(w) = &writer {
+        unsafe { w.Finalize()? };
+    }
+    if let Some(e) = enc.as_mut() {
+        e.finish()?;
+    }
     let (pf, wsf, cpu1) = process_stats();
     let _ = session.Close();
     let _ = pool.Close();
 
+    if let Some(e) = &enc {
+        report_packets(e, wall, &path);
+    }
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     println!("\n--- result ---");
     println!("file: {path}  ({:.2} MB, avg {:.2} Mbps)", bytes as f64 / 1048576.0, bytes as f64 * 8.0 / wall / 1e6);
@@ -410,4 +454,35 @@ fn real_main() -> Res<()> {
     println!("private memory: start {base_private:.1} -> after setup {priv0:.1} -> peak {peak_private:.1} -> end {pf:.1} MB (working set end {wsf:.1} MB)");
     println!("slowest single frame submit: {slowest_ms:.1} ms");
     Ok(())
+}
+
+fn report_packets(e: &crate::mft::MftEncoder, wall: f64, path: &str) {
+    let n = e.packets.len();
+    let total: usize = e.packets.iter().map(|p| p.data.len()).sum();
+    let keys: Vec<&crate::mft::Packet> = e.packets.iter().filter(|p| p.key).collect();
+    let max = e.packets.iter().map(|p| p.data.len()).max().unwrap_or(0);
+    println!("\n--- packets from {} ---", e.name);
+    println!("packets {n}, dropped input frames {}, keyframes {}", e.dropped, keys.len());
+    println!("total {:.2} MB, avg {:.2} Mbps, largest packet {:.0} KB", total as f64 / 1048576.0, total as f64 * 8.0 / wall / 1e6, max as f64 / 1024.0);
+    let gaps: Vec<String> = keys
+        .windows(2)
+        .map(|w| format!("{:.2}", (w[1].pts_100ns - w[0].pts_100ns) as f64 / 1e7))
+        .collect();
+    println!("seconds between keyframes: {}", if gaps.is_empty() { "n/a".into() } else { gaps.join(" ") });
+    if let Some(k) = keys.first() {
+        let d = &k.data;
+        let has = |nal: u8| d.windows(5).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1f) == nal || (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 && (w[4] & 0x1f) == nal));
+        println!("first keyframe has SPS: {}, PPS: {}", has(7), has(8));
+    }
+    let bps = total as f64 / wall;
+    println!("a 120 s ring at this rate would hold about {:.0} MB", bps * 120.0 / 1048576.0);
+    let h264 = format!("{path}.h264");
+    let mut out = Vec::with_capacity(total);
+    for p in &e.packets {
+        out.extend_from_slice(&p.data);
+    }
+    match std::fs::write(&h264, out) {
+        Ok(()) => println!("raw stream written to {h264} (plays in VLC)"),
+        Err(err) => println!("could not write {h264}: {err}"),
+    }
 }

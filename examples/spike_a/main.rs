@@ -1,4 +1,6 @@
 #[cfg(windows)]
+mod mft;
+#[cfg(windows)]
 mod win;
 
 fn main() {
