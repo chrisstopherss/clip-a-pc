@@ -76,10 +76,14 @@ fn friendly_name(dev: &IMMDevice) -> String {
 }
 
 fn open_capture(en: &IMMDeviceEnumerator, render: bool) -> Res<Capture> {
+    let dev = unsafe { en.GetDefaultAudioEndpoint(if render { eRender } else { eCapture }, eConsole)? };
+    open_device(&dev, render)
+}
+
+fn open_device(dev: &IMMDevice, render: bool) -> Res<Capture> {
     unsafe {
-        let dev = en.GetDefaultAudioEndpoint(if render { eRender } else { eCapture }, eConsole)?;
         let id = pwstr_to_string(dev.GetId()?);
-        let name = friendly_name(&dev);
+        let name = friendly_name(dev);
         let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
         // Ask the audio engine for 48 kHz stereo float no matter what the device uses.
         let fmt = WAVEFORMATEX {
@@ -312,8 +316,90 @@ fn write_adts(path: &str, frames: &[Vec<u8>]) -> std::io::Result<()> {
 
 // ---------------------------------------------------------------- main
 
+/// Read waiting packets and return the loudest sample, discarding the audio.
+fn peek_peak(c: &Capture) -> f32 {
+    let mut peak = 0f32;
+    unsafe {
+        while c.cap.GetNextPacketSize().unwrap_or(0) > 0 {
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let (mut frames, mut flags) = (0u32, 0u32);
+            if c.cap.GetBuffer(&mut data, &mut frames, &mut flags, None, None).is_err() {
+                break;
+            }
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
+                let s = std::slice::from_raw_parts(data as *const f32, frames as usize * 2);
+                peak = s.iter().fold(peak, |p, v| p.max(v.abs()));
+            }
+            let _ = c.cap.ReleaseBuffer(frames);
+        }
+    }
+    peak
+}
+
+fn scan(secs: u64) -> Res<()> {
+    let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let def_out = default_id(&en, true);
+    let def_in = default_id(&en, false);
+    let mut list: Vec<(Capture, bool, bool, f32, u32)> = Vec::new(); // capture, render, is_default, peak, loud seconds
+    for render in [true, false] {
+        let flow = if render { eRender } else { eCapture };
+        let coll = unsafe { en.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)? };
+        for i in 0..unsafe { coll.GetCount()? } {
+            let dev = unsafe { coll.Item(i)? };
+            match open_device(&dev, render) {
+                Ok(c) => {
+                    let is_def = Some(&c.id) == if render { def_out.as_ref() } else { def_in.as_ref() };
+                    list.push((c, render, is_def, 0.0, 0));
+                }
+                Err(e) => println!("could not open {}: {e}", friendly_name(&dev)),
+            }
+        }
+    }
+    println!("listening to {} devices for {secs} s. Play audio the way you normally do (game, browser, music) and talk.\n", list.len());
+    let start = Instant::now();
+    let mut last = Instant::now();
+    let mut sec_peak = vec![0f32; list.len()];
+    while start.elapsed() < Duration::from_secs(secs) {
+        std::thread::sleep(Duration::from_millis(20));
+        for (i, item) in list.iter_mut().enumerate() {
+            let p = peek_peak(&item.0);
+            item.3 = item.3.max(p);
+            sec_peak[i] = sec_peak[i].max(p);
+        }
+        if last.elapsed() >= Duration::from_secs(1) {
+            last = Instant::now();
+            for (i, item) in list.iter_mut().enumerate() {
+                if sec_peak[i] > 0.005 {
+                    item.4 += 1;
+                }
+                sec_peak[i] = 0.0;
+            }
+        }
+    }
+    println!("{:<18} {:<8} {:>5} {:>8}  device", "kind", "default", "peak", "loud s");
+    for (c, render, is_def, peak, loud) in &list {
+        println!(
+            "{:<18} {:<8} {:>5.2} {:>8}  {}",
+            if *render { "output (loopback)" } else { "input (mic)" },
+            if *is_def { "DEFAULT" } else { "" },
+            peak,
+            loud,
+            c.name
+        );
+    }
+    Ok(())
+}
+
 fn real_main() -> Res<()> {
-    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|a| a == "--devices").unwrap_or(false) {
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            timeBeginPeriod(1);
+        }
+        return scan(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10));
+    }
+    let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(15);
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
