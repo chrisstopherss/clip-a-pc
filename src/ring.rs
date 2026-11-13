@@ -23,6 +23,13 @@ pub struct Entry {
     off: u64,
 }
 
+impl Entry {
+    /// Metadata for a packet stored somewhere other than the ring (live recording).
+    pub fn new(track: Track, pts: i64, key: bool, len: usize) -> Self {
+        Self { track, pts, key, len, off: 0 }
+    }
+}
+
 pub struct Ring {
     buf: Vec<u8>,
     entries: VecDeque<Entry>,

@@ -28,8 +28,23 @@ The exe is not code signed yet, so Windows SmartScreen may warn the first time.
 ## Use
 
 1. Run `clip-a-pc.exe`. On first run pick a monitor and a clip length.
-2. Press Alt+C any time. You get a notification and a short sound.
-3. Clips land in `Videos\clip-a-pc`.
+2. Press a hotkey any time. You get a notification and a short sound.
+3. Clips and recordings land in `Videos\clip-a-pc`.
+
+| Hotkey | What it does |
+|---|---|
+| Alt+C | Save the last few seconds, as long as your Clip length setting |
+| Alt+X | Pop up a menu and pick how many seconds to save (up to your Clip length) |
+| Alt+V | Start recording. Press it again to stop and save the whole recording |
+
+Alt+V records straight to disk, so it is not limited by the Clip length and does
+not use more memory the longer it runs. It starts at the nearest keyframe, up to a
+second before you press it. While it runs the tray icon changes and its tooltip
+shows the time. A recording stops by itself after two hours, or if the screen
+changes. Alt+C keeps working during a recording.
+
+The recording file is only playable once it has been stopped. If the program or the
+PC crashes mid-recording, that file is lost.
 
 Right-click the tray icon for settings, the clips folder, and quit.
 

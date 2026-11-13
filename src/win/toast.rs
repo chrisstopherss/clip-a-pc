@@ -44,43 +44,61 @@ pub fn notify(title: &str, body: &str) {
     }
 }
 
-/// Two short rising tones as a WAV image, built once.
-fn chime_wav() -> &'static Vec<u8> {
-    static WAV: OnceLock<Vec<u8>> = OnceLock::new();
-    WAV.get_or_init(|| {
-        let rate = 22_050u32;
-        let mut pcm: Vec<i16> = Vec::new();
-        for (freq, ms) in [(784.0f32, 70u32), (1175.0f32, 90u32)] {
-            let n = (rate * ms / 1000) as usize;
-            for i in 0..n {
-                let t = i as f32 / rate as f32;
-                let fade = (1.0 - i as f32 / n as f32).powf(0.6) * (i as f32 / 120.0).min(1.0);
-                pcm.push(((t * freq * std::f32::consts::TAU).sin() * 0.22 * fade * 32767.0) as i16);
-            }
-        }
-        let data_len = (pcm.len() * 2) as u32;
-        let mut v = Vec::new();
-        v.extend_from_slice(b"RIFF");
-        v.extend_from_slice(&(36 + data_len).to_le_bytes());
-        v.extend_from_slice(b"WAVEfmt ");
-        v.extend_from_slice(&16u32.to_le_bytes());
-        v.extend_from_slice(&1u16.to_le_bytes());
-        v.extend_from_slice(&1u16.to_le_bytes());
-        v.extend_from_slice(&rate.to_le_bytes());
-        v.extend_from_slice(&(rate * 2).to_le_bytes());
-        v.extend_from_slice(&2u16.to_le_bytes());
-        v.extend_from_slice(&16u16.to_le_bytes());
-        v.extend_from_slice(b"data");
-        v.extend_from_slice(&data_len.to_le_bytes());
-        for s in pcm {
-            v.extend_from_slice(&s.to_le_bytes());
-        }
-        v
-    })
+/// Which sound to play.
+#[derive(Clone, Copy)]
+pub enum Chime {
+    /// A clip was saved: two rising tones.
+    Saved,
+    /// A recording started: three quick rising tones.
+    RecordStart,
+    /// A recording stopped: two falling tones.
+    RecordStop,
 }
 
-pub fn chime() {
-    let wav = chime_wav();
+fn build_wav(tones: &[(f32, u32)]) -> Vec<u8> {
+    let rate = 22_050u32;
+    let mut pcm: Vec<i16> = Vec::new();
+    for &(freq, ms) in tones {
+        let n = (rate * ms / 1000) as usize;
+        for i in 0..n {
+            let t = i as f32 / rate as f32;
+            let fade = (1.0 - i as f32 / n as f32).powf(0.6) * (i as f32 / 120.0).min(1.0);
+            pcm.push(((t * freq * std::f32::consts::TAU).sin() * 0.22 * fade * 32767.0) as i16);
+        }
+    }
+    let data_len = (pcm.len() * 2) as u32;
+    let mut v = Vec::new();
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data_len).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&rate.to_le_bytes());
+    v.extend_from_slice(&(rate * 2).to_le_bytes());
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&16u16.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&data_len.to_le_bytes());
+    for s in pcm {
+        v.extend_from_slice(&s.to_le_bytes());
+    }
+    v
+}
+
+fn wav(kind: Chime) -> &'static Vec<u8> {
+    static SAVED: OnceLock<Vec<u8>> = OnceLock::new();
+    static START: OnceLock<Vec<u8>> = OnceLock::new();
+    static STOP: OnceLock<Vec<u8>> = OnceLock::new();
+    match kind {
+        Chime::Saved => SAVED.get_or_init(|| build_wav(&[(784.0, 70), (1175.0, 90)])),
+        Chime::RecordStart => START.get_or_init(|| build_wav(&[(660.0, 60), (880.0, 60), (1175.0, 90)])),
+        Chime::RecordStop => STOP.get_or_init(|| build_wav(&[(1175.0, 80), (784.0, 110)])),
+    }
+}
+
+pub fn chime(kind: Chime) {
+    let wav = wav(kind);
     unsafe {
         let _ = PlaySoundW(PCWSTR(wav.as_ptr() as *const u16), None, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
     }

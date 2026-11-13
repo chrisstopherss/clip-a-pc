@@ -12,18 +12,18 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT};
-use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
+use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::engine::{Engine, EngineCfg};
+use super::engine::{Engine, EngineCfg, Finished};
 use super::log::{log, log_path, trim};
 use super::settings_ui::{self, Pending, PENDING, SETTINGS_HWND, WM_APP_QUIT, WM_APP_SETTINGS_DONE};
 use super::store::{autostart_enabled, load_config, save_config, set_autostart};
-use super::toast;
+use super::toast::{self, Chime};
 use super::updater::{self, Outcome, VERSION};
 use super::util::{memory_mb, videos_dir};
 use super::video::list_monitors;
-use crate::config::Config;
+use crate::config::{Config, DURATIONS_SECS};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_SAVE: usize = 1001;
@@ -33,7 +33,13 @@ const ID_LOG: usize = 1004;
 const ID_QUIT: usize = 1005;
 const ID_UPDATE: usize = 1006;
 const WM_APP_APPLY_UPDATE: u32 = WM_APP + 4;
-const HOTKEY_ID: i32 = 1;
+const ID_RECORD: usize = 1007;
+/// Menu ids from here up mean "save this many seconds" (the id minus this base).
+const ID_LEN_BASE: usize = 3000;
+const HOTKEY_SAVE: i32 = 1;
+const HOTKEY_MENU: i32 = 2;
+const HOTKEY_REC: i32 = 3;
+const TIMER_REC: usize = 1;
 
 struct State {
     engine: Option<Arc<Engine>>,
@@ -45,6 +51,7 @@ static SAVING: AtomicBool = AtomicBool::new(false);
 static FIRST_RUN: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ICON: AtomicIsize = AtomicIsize::new(0);
+static ICON_REC: AtomicIsize = AtomicIsize::new(0);
 /// Version of a downloaded, verified update that is waiting to be installed.
 static UPDATE_READY: Mutex<Option<String>> = Mutex::new(None);
 
@@ -93,7 +100,7 @@ fn start_engine(cfg: &Config) -> Option<Arc<Engine>> {
     }
 }
 
-fn restart_engine(cfg: Config) {
+fn restart_engine(cfg: Config, hwnd: HWND) {
     let old = {
         let mut st = state().lock().unwrap();
         st.cfg = cfg.clone();
@@ -101,12 +108,13 @@ fn restart_engine(cfg: Config) {
     };
     if let Some(e) = old {
         e.stop();
+        report_finished(hwnd, e.take_finished());
     }
     let new = start_engine(&cfg);
     state().lock().unwrap().engine = new;
 }
 
-fn save_clip() {
+fn save_clip(secs: Option<u32>) {
     if SAVING.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -122,9 +130,13 @@ fn save_clip() {
         }
         let t = Instant::now();
         let (p0, _) = memory_mb();
-        match engine.save() {
+        let result = match secs {
+            Some(n) => engine.save_secs(n),
+            None => engine.save(),
+        };
+        match result {
             Ok(s) => {
-                toast::chime();
+                toast::chime(Chime::Saved);
                 let name = s.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 toast::notify("Clip saved", &format!("{:.0} s, {:.1} MB  ({name})", s.seconds, s.bytes as f64 / 1048576.0));
                 let (p1, w1) = memory_mb();
@@ -143,6 +155,80 @@ fn save_clip() {
         }
         SAVING.store(false, Ordering::SeqCst);
     });
+}
+
+// ------------------------------------------------------------------ manual recording
+
+fn clock(secs: f64) -> String {
+    let s = secs as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+/// Tell the user a recording ended, and put the tray back to normal.
+fn report_finished(hwnd: HWND, f: Option<Result<Finished, String>>) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_REC);
+        tray_set(hwnd, None);
+    }
+    let Some(f) = f else { return };
+    match f {
+        Ok(f) => {
+            toast::chime(Chime::RecordStop);
+            let name = f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let why = if f.note.is_empty() { String::new() } else { format!(" Stopped because {}.", f.note) };
+            toast::notify("Recording saved", &format!("{}, {:.0} MB  ({name}).{why}", clock(f.seconds), f.bytes as f64 / 1048576.0));
+            log(&format!("recording saved: {} ({}, {:.1} MB) {}", f.path.display(), clock(f.seconds), f.bytes as f64 / 1048576.0, f.note));
+        }
+        Err(e) => {
+            toast::notify("The recording could not be saved", &e);
+            log(&format!("recording failed: {e}"));
+        }
+    }
+}
+
+fn toggle_recording(hwnd: HWND) {
+    let engine = state().lock().unwrap().engine.clone();
+    let Some(engine) = engine else {
+        toast::notify("Nothing to record", "Recording is not running.");
+        return;
+    };
+    if engine.recording_elapsed().is_some() {
+        let r = engine.stop_recording().map_err(|e| e.to_string());
+        report_finished(hwnd, Some(r));
+    } else {
+        match engine.start_recording() {
+            Ok(path) => {
+                toast::chime(Chime::RecordStart);
+                toast::notify("Recording started", "Press Alt+V again to stop and save.");
+                log(&format!("recording started: {}", path.display()));
+                unsafe {
+                    tray_set(hwnd, Some(Duration::ZERO));
+                    SetTimer(Some(hwnd), TIMER_REC, 1000, None);
+                }
+            }
+            Err(e) => {
+                toast::notify("Could not start recording", &e.to_string());
+                log(&format!("could not start recording: {e}"));
+            }
+        }
+    }
+}
+
+/// Once a second while recording: keep the tray tooltip current and notice a recording that ended by itself.
+fn on_timer(hwnd: HWND) {
+    let engine = state().lock().unwrap().engine.clone();
+    let Some(engine) = engine else {
+        report_finished(hwnd, None);
+        return;
+    };
+    match engine.recording_elapsed() {
+        Some(d) => unsafe { tray_set(hwnd, Some(d)) },
+        None => report_finished(hwnd, engine.take_finished()),
+    }
 }
 
 // ------------------------------------------------------------------ updates
@@ -200,7 +286,7 @@ fn apply_update(hwnd: HWND) {
 // ------------------------------------------------------------------ tray
 
 /// A red record dot, drawn at runtime so the exe needs no icon file.
-unsafe fn make_icon() -> HICON {
+unsafe fn make_icon(recording: bool) -> HICON {
     const N: i32 = 32;
     let mut px = vec![0u8; (N * N * 4) as usize];
     for y in 0..N {
@@ -208,7 +294,7 @@ unsafe fn make_icon() -> HICON {
             let (dx, dy) = (x as f32 + 0.5 - N as f32 / 2.0, y as f32 + 0.5 - N as f32 / 2.0);
             let d = (dx * dx + dy * dy).sqrt();
             let alpha = (13.5 - d).clamp(0.0, 1.0);
-            let white = (5.0 - d).clamp(0.0, 1.0);
+            let white = if recording { (1.3 - (d - 8.5).abs()).clamp(0.0, 1.0) } else { (5.0 - d).clamp(0.0, 1.0) };
             let (r, g, b) = (229.0 * (1.0 - white) + 255.0 * white, 57.0 * (1.0 - white) + 255.0 * white, 53.0 * (1.0 - white) + 255.0 * white);
             let i = ((y * N + x) * 4) as usize;
             // premultiplied BGRA
@@ -238,10 +324,35 @@ unsafe fn tray_add(hwnd: HWND) {
         hIcon: HICON(ICON.load(Ordering::Relaxed) as *mut _),
         ..Default::default()
     };
-    for (i, u) in format!("clip-a-pc {VERSION}  (Alt+C saves a clip)").encode_utf16().take(127).enumerate() {
+    for (i, u) in tooltip().encode_utf16().take(127).enumerate() {
         nid.szTip[i] = u;
     }
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+/// Switch the tray icon and tooltip between normal and recording.
+unsafe fn tray_set(hwnd: HWND, recording: Option<Duration>) {
+    let icon = if recording.is_some() { ICON_REC.load(Ordering::Relaxed) } else { ICON.load(Ordering::Relaxed) };
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_ICON | NIF_TIP,
+        hIcon: HICON(icon as *mut _),
+        ..Default::default()
+    };
+    let tip = match recording {
+        Some(d) => format!("RECORDING {}  (Alt+V stops)", clock(d.as_secs_f64())),
+        None => tooltip(),
+    };
+    for (i, u) in tip.encode_utf16().take(127).enumerate() {
+        nid.szTip[i] = u;
+    }
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+fn tooltip() -> String {
+    format!("clip-a-pc {VERSION}  (Alt+C clip, Alt+X pick length, Alt+V record)")
 }
 
 unsafe fn tray_remove(hwnd: HWND) {
@@ -262,7 +373,9 @@ fn open_settings(hwnd: HWND) {
 
 unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return };
+    let recording = state().lock().unwrap().engine.as_ref().map(|e| e.recording_elapsed().is_some()).unwrap_or(false);
     let _ = AppendMenuW(menu, MF_STRING, ID_SAVE, w!("Save clip now"));
+    let _ = AppendMenuW(menu, MF_STRING, ID_RECORD, if recording { w!("Stop recording") } else { w!("Start recording") });
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
     let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open clips folder"));
     let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
@@ -278,7 +391,8 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
-        ID_SAVE => save_clip(),
+        ID_SAVE => save_clip(None),
+        ID_RECORD => toggle_recording(hwnd),
         ID_SETTINGS => open_settings(hwnd),
         ID_FOLDER => {
             let dir = videos_dir().join("clip-a-pc");
@@ -294,13 +408,37 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 }
 
+/// Alt+X: a small menu at the cursor asking how many seconds to save.
+unsafe fn show_length_menu(hwnd: HWND) {
+    let configured = state().lock().unwrap().cfg.duration_secs;
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("Save the last..."));
+    for d in DURATIONS_SECS.iter().filter(|&&d| d <= configured) {
+        let _ = AppendMenuW(menu, MF_STRING, ID_LEN_BASE + *d as usize, &HSTRING::from(format!("{d} seconds")));
+    }
+    if DURATIONS_SECS.iter().any(|&d| d > configured) {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("Longer needs a longer Clip length in Settings"));
+    }
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    let id = cmd.0 as usize;
+    if id > ID_LEN_BASE && id < ID_LEN_BASE + 1000 {
+        save_clip(Some((id - ID_LEN_BASE) as u32));
+    }
+}
+
 fn apply_pending(hwnd: HWND) {
     let Some(Pending { cfg, autostart }) = PENDING.lock().unwrap().take() else { return };
     if let Err(e) = save_config(&cfg) {
         log(&format!("could not save settings: {e}"));
     }
     set_autostart(autostart);
-    restart_engine(cfg);
+    restart_engine(cfg, hwnd);
     if FIRST_RUN.swap(false, Ordering::SeqCst) {
         toast::notify("clip-a-pc is running", "Press Alt+C any time to save a clip.");
     }
@@ -310,7 +448,16 @@ fn apply_pending(hwnd: HWND) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_HOTKEY => {
-            save_clip();
+            match wp.0 as i32 {
+                HOTKEY_SAVE => save_clip(None),
+                HOTKEY_MENU => show_length_menu(hwnd),
+                HOTKEY_REC => toggle_recording(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            on_timer(hwnd);
             LRESULT(0)
         }
         WM_TRAY => {
@@ -334,7 +481,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            for id in [HOTKEY_SAVE, HOTKEY_MENU, HOTKEY_REC] {
+                let _ = UnregisterHotKey(Some(hwnd), id);
+            }
             tray_remove(hwnd);
             let engine = state().lock().unwrap().engine.take();
             if let Some(e) = engine {
@@ -383,7 +532,8 @@ pub fn run() {
         toast::register();
 
         let hinst = GetModuleHandleW(None).unwrap_or_default();
-        ICON.store(make_icon().0 as isize, Ordering::Relaxed);
+        ICON.store(make_icon(false).0 as isize, Ordering::Relaxed);
+        ICON_REC.store(make_icon(true).0 as isize, Ordering::Relaxed);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         let class = w!("ClipAPCMain");
         let wc = WNDCLASSEXW {
@@ -400,9 +550,15 @@ pub fn run() {
         };
         tray_add(hwnd);
 
-        if RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, 'C' as u32).is_err() {
-            log("could not register Alt+C: another program already uses it");
-            toast::notify("Alt+C is already in use", "Another program has this shortcut, so clip-a-pc cannot use it.");
+        let mut taken = Vec::new();
+        for (id, key, name) in [(HOTKEY_SAVE, 'C', "Alt+C"), (HOTKEY_MENU, 'X', "Alt+X"), (HOTKEY_REC, 'V', "Alt+V")] {
+            if RegisterHotKey(Some(hwnd), id, MOD_ALT | MOD_NOREPEAT, key as u32).is_err() {
+                log(&format!("could not register {name}: another program already uses it"));
+                taken.push(name);
+            }
+        }
+        if !taken.is_empty() {
+            toast::notify("A shortcut is already in use", &format!("{} belongs to another program, so clip-a-pc cannot use it.", taken.join(", ")));
         }
 
         match load_config() {
@@ -424,7 +580,7 @@ pub fn run() {
             let hw = hwnd.0 as isize;
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(after));
-                save_clip();
+                save_clip(None);
                 std::thread::sleep(Duration::from_secs(4));
                 let _ = PostMessageW(Some(HWND(hw as *mut _)), WM_APP_QUIT, WPARAM(0), LPARAM(0));
             });

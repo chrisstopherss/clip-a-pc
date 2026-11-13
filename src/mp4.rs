@@ -116,10 +116,10 @@ fn audio_samples(a: &[Entry]) -> Samples {
 
 // ---- chunk layout ----------------------------------------------------------
 
-struct Chunk {
-    video: bool,
-    first: usize,
-    count: usize,
+pub(crate) struct Chunk {
+    pub(crate) video: bool,
+    pub(crate) first: usize,
+    pub(crate) count: usize,
 }
 
 /// Interleave: for each second of the clip, the video samples then the audio samples.
@@ -216,7 +216,7 @@ fn trak(
     s: &Samples,
     entry: &[u8],
     chunk_runs: &[(u32, u32)],
-    chunk_offsets: &[u32],
+    chunk_offsets: &[u64],
     dims: (u32, u32),
 ) -> Vec<u8> {
     let movie_dur = s.duration * MOVIE_TIMESCALE as u64 / timescale as u64;
@@ -288,16 +288,26 @@ fn trak(
         stsz_p.extend_from_slice(&u32b(*z));
     }
     let stsz = full(b"stsz", 0, &stsz_p);
-    let mut stco_p = u32b(chunk_offsets.len() as u32).to_vec();
-    for o in chunk_offsets {
-        stco_p.extend_from_slice(&u32b(*o));
-    }
-    let stco = full(b"stco", 0, &stco_p);
+    let stco = offsets_box(chunk_offsets);
 
     let stbl = bx(b"stbl", &cat(&[&stsd, &stts, &stss, &stsc, &stsz, &stco]));
     let minf = bx(b"minf", &cat(&[&media_header, &dinf, &stbl]));
     let mdia = bx(b"mdia", &cat(&[&mdhd, &hdlr, &minf]));
     bx(b"trak", &cat(&[&tkhd, &mdia]))
+}
+
+/// Chunk offsets as 32-bit `stco`, or 64-bit `co64` when the file is bigger than 4 GB.
+fn offsets_box(offsets: &[u64]) -> Vec<u8> {
+    let wide = offsets.iter().any(|&o| o > u32::MAX as u64);
+    let mut p = u32b(offsets.len() as u32).to_vec();
+    for &o in offsets {
+        if wide {
+            p.extend_from_slice(&o.to_be_bytes());
+        } else {
+            p.extend_from_slice(&u32b(o as u32));
+        }
+    }
+    full(if wide { b"co64" } else { b"stco" }, 0, &p)
 }
 
 /// Run-length encode per-chunk sample counts as (chunks in run, samples per chunk).
@@ -312,13 +322,13 @@ fn chunk_runs(counts: &[usize]) -> Vec<(u32, u32)> {
     runs
 }
 
-fn build_moov(
+pub(crate) fn build_moov(
     clip: &Clip,
     v: &VideoParams,
     a: Option<&AudioParams>,
     chunks: &[Chunk],
-    video_offsets: &[u32],
-    audio_offsets: &[u32],
+    video_offsets: &[u64],
+    audio_offsets: &[u64],
 ) -> io::Result<Vec<u8>> {
     let vs = video_samples(&clip.video, clip.start_pts);
     let v_counts: Vec<usize> = chunks.iter().filter(|c| c.video).map(|c| c.count).collect();
@@ -408,7 +418,7 @@ pub fn write_mp4<W: Write>(
     let mut pos = (ftyp.len() + probe.len() + 8) as u64;
     let (mut vo, mut ao) = (Vec::new(), Vec::new());
     for c in &chunks {
-        if c.video { vo.push(pos as u32) } else { ao.push(pos as u32) }
+        if c.video { vo.push(pos) } else { ao.push(pos) }
         pos += (0..c.count).map(|i| entry(c, i).len as u64).sum::<u64>();
     }
     let moov = build_moov(clip, v, a, &chunks, &vo, &ao)?;
@@ -427,23 +437,23 @@ pub fn write_mp4<W: Write>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::h264::{annexb_to_avcc, split_nals};
     use crate::ring::Track;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    fn have(tool: &str) -> bool {
+    pub(crate) fn have(tool: &str) -> bool {
         Command::new(tool).arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
     }
 
-    fn tmp(name: &str) -> PathBuf {
+    pub(crate) fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("clip-a-pc-test-{}-{name}", std::process::id()))
     }
 
     /// Split an Annex B stream into access units (one per frame, single slice).
-    fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
+    pub(crate) fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
         let mut aus: Vec<Vec<u8>> = Vec::new();
         let mut cur: Vec<u8> = Vec::new();
         let mut has_slice = false;
@@ -465,7 +475,7 @@ mod tests {
     }
 
     /// Split an ADTS stream into raw AAC frames and return the AudioSpecificConfig.
-    fn adts_frames(data: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
+    pub(crate) fn adts_frames(data: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
         let (mut frames, mut i, mut asc) = (Vec::new(), 0, Vec::new());
         while i + 7 <= data.len() {
             assert!(data[i] == 0xFF && data[i + 1] & 0xF0 == 0xF0, "bad ADTS sync");
@@ -484,13 +494,13 @@ mod tests {
         (frames, asc)
     }
 
-    fn run(cmd: &mut Command) -> std::process::Output {
+    pub(crate) fn run(cmd: &mut Command) -> std::process::Output {
         let o = cmd.output().expect("failed to run tool");
         assert!(o.status.success(), "{:?}\n{}", cmd, String::from_utf8_lossy(&o.stderr));
         o
     }
 
-    fn make_media(dir: &Path) -> (PathBuf, PathBuf) {
+    pub(crate) fn make_media(dir: &Path) -> (PathBuf, PathBuf) {
         let (vf, af) = (dir.join("v.h264"), dir.join("a.aac"));
         run(Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30", "-t", "6",
             "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "main", "-bf", "0", "-g", "30",
@@ -595,5 +605,16 @@ mod tests {
         let dec = run(Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&out).args(["-f", "null", "-"]));
         assert!(dec.stderr.is_empty(), "{}", String::from_utf8_lossy(&dec.stderr));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn offsets_use_64_bit_boxes_only_when_needed() {
+        let small = offsets_box(&[100, 4_000_000_000]);
+        assert_eq!(&small[4..8], b"stco");
+        let big = offsets_box(&[100, 5_000_000_000]);
+        assert_eq!(&big[4..8], b"co64");
+        // 8 header + 4 version/flags + 4 count + 2 * 8 entries
+        assert_eq!(big.len(), 8 + 4 + 4 + 16);
+        assert_eq!(&big[big.len() - 8..], &5_000_000_000u64.to_be_bytes());
     }
 }
