@@ -33,6 +33,7 @@ const ID_MONITOR: i32 = 101;
 const ID_LENGTH: i32 = 102;
 const ID_MIC: i32 = 103;
 const ID_AUTOSTART: i32 = 104;
+const ID_UPDATES: i32 = 105;
 
 struct Ui {
     main: isize,
@@ -44,6 +45,7 @@ struct Ui {
     length: HWND,
     mic: HWND,
     autostart: HWND,
+    updates: HWND,
     font: HFONT,
 }
 
@@ -79,6 +81,7 @@ pub fn open(main: HWND, first_run: bool, current: Config, autostart: bool) {
             length: HWND::default(),
             mic: HWND::default(),
             autostart: HWND::default(),
+            updates: HWND::default(),
             font: HFONT::default(),
         });
         let title = if first_run { "Welcome to clip-a-pc" } else { "clip-a-pc settings" };
@@ -163,8 +166,9 @@ unsafe fn build(hwnd: HWND, ui: &mut Ui) {
     child(hwnd, w!("STATIC"), "Microphone volume", 0, (16, 138, 130, 20), 0, dpi, ui.font);
     ui.mic = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 134, 234, 200), ID_MIC, dpi, ui.font);
     ui.autostart = child(hwnd, w!("BUTTON"), "Start with Windows", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 176, 368, 22), ID_AUTOSTART, dpi, ui.font);
-    child(hwnd, w!("BUTTON"), "Save", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP.0, (210, 220, 84, 28), ID_OK, dpi, ui.font);
-    child(hwnd, w!("BUTTON"), "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP.0, (300, 220, 84, 28), ID_CANCEL, dpi, ui.font);
+    ui.updates = child(hwnd, w!("BUTTON"), "Update automatically", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 204, 368, 22), ID_UPDATES, dpi, ui.font);
+    child(hwnd, w!("BUTTON"), "Save", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP.0, (210, 248, 84, 28), ID_OK, dpi, ui.font);
+    child(hwnd, w!("BUTTON"), "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP.0, (300, 248, 84, 28), ID_CANCEL, dpi, ui.font);
 
     for m in &ui.monitors {
         let n = list_index_label(m);
@@ -192,9 +196,12 @@ unsafe fn build(hwnd: HWND, ui: &mut Ui) {
     if ui.initial_autostart {
         SendMessageW(ui.autostart, BM_SETCHECK, Some(WPARAM(1)), None);
     }
+    if ui.initial.auto_update {
+        SendMessageW(ui.updates, BM_SETCHECK, Some(WPARAM(1)), None);
+    }
 
-    // size the window around a 400 x 262 client area and centre it on screen
-    let mut r = RECT { left: 0, top: 0, right: scaled(400, dpi), bottom: scaled(262, dpi) };
+    // size the window around a 400 x 292 client area and centre it on screen
+    let mut r = RECT { left: 0, top: 0, right: scaled(400, dpi), bottom: scaled(292, dpi) };
     let _ = AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, false, WS_EX_APPWINDOW, dpi);
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     let (sw, sh) = (GetSystemMetricsForDpi(SM_CXSCREEN, dpi), GetSystemMetricsForDpi(SM_CYSCREEN, dpi));
@@ -212,6 +219,7 @@ unsafe fn finish(hwnd: HWND, ui: &Ui, save: bool) {
             duration_secs: DURATIONS_SECS[sel(ui.length).min(DURATIONS_SECS.len() - 1)],
             monitor: ui.monitors.get(sel(ui.monitor)).map(|m| m.device_name.clone()).unwrap_or_default(),
             mic_gain: MIC_GAINS[sel(ui.mic).min(MIC_GAINS.len() - 1)],
+            auto_update: SendMessageW(ui.updates, BM_GETCHECK, None, None).0 == 1,
         };
         let autostart = SendMessageW(ui.autostart, BM_GETCHECK, None, None).0 == 1;
         *PENDING.lock().unwrap() = Some(Pending { cfg, autostart });

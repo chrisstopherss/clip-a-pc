@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the version in Cargo.toml
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash target/release/clip-a-pc.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  clip-a-pc.exe" | Out-File -FilePath target/release/clip-a-pc.exe.sha256 -Encoding ascii -NoNewline
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            target/release/clip-a-pc.exe \
+            target/release/clip-a-pc.exe.sha256 \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md

@@ -20,6 +20,7 @@ use super::log::{log, log_path, trim};
 use super::settings_ui::{self, Pending, PENDING, SETTINGS_HWND, WM_APP_QUIT, WM_APP_SETTINGS_DONE};
 use super::store::{autostart_enabled, load_config, save_config, set_autostart};
 use super::toast;
+use super::updater::{self, Outcome, VERSION};
 use super::util::{memory_mb, videos_dir};
 use super::video::list_monitors;
 use crate::config::Config;
@@ -30,6 +31,8 @@ const ID_SETTINGS: usize = 1002;
 const ID_FOLDER: usize = 1003;
 const ID_LOG: usize = 1004;
 const ID_QUIT: usize = 1005;
+const ID_UPDATE: usize = 1006;
+const WM_APP_APPLY_UPDATE: u32 = WM_APP + 4;
 const HOTKEY_ID: i32 = 1;
 
 struct State {
@@ -42,6 +45,8 @@ static SAVING: AtomicBool = AtomicBool::new(false);
 static FIRST_RUN: AtomicBool = AtomicBool::new(false);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static ICON: AtomicIsize = AtomicIsize::new(0);
+/// Version of a downloaded, verified update that is waiting to be installed.
+static UPDATE_READY: Mutex<Option<String>> = Mutex::new(None);
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State { engine: None, cfg: Config::default() }))
@@ -140,6 +145,58 @@ fn save_clip() {
     });
 }
 
+// ------------------------------------------------------------------ updates
+
+/// Checks once shortly after start, then every 6 hours. The first check installs
+/// right away (the buffer is nearly empty then); later ones wait for the user, so a
+/// restart never throws away footage they might still want.
+fn spawn_updater(hwnd: isize) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        updater::cleanup_old();
+        let mut first = true;
+        loop {
+            let enabled = state().lock().unwrap().cfg.auto_update;
+            let waiting = UPDATE_READY.lock().unwrap().is_some();
+            if enabled && !waiting {
+                match updater::check_and_download() {
+                    Outcome::Ready(v) => {
+                        log(&format!("update {v} downloaded and verified"));
+                        *UPDATE_READY.lock().unwrap() = Some(v.clone());
+                        let busy = SAVING.load(Ordering::SeqCst) || SETTINGS_HWND.load(Ordering::SeqCst) != 0 || FIRST_RUN.load(Ordering::SeqCst);
+                        if first && !busy {
+                            unsafe {
+                                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_APP_APPLY_UPDATE, WPARAM(0), LPARAM(0));
+                            }
+                        } else {
+                            toast::notify("clip-a-pc update ready", &format!("Version {v} is ready. Right-click the tray icon and choose Restart to update."));
+                        }
+                    }
+                    Outcome::UpToDate => log(&format!("update check: version {VERSION} is current")),
+                    Outcome::Failed(e) => log(&format!("update check failed: {e}")),
+                }
+            }
+            first = false;
+            std::thread::sleep(Duration::from_secs(6 * 3600));
+        }
+    });
+}
+
+fn apply_update(hwnd: HWND) {
+    match updater::apply_and_restart() {
+        Ok(()) => {
+            log("restarting into the new version");
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        Err(e) => {
+            log(&format!("update could not be installed: {e}"));
+            toast::notify("Update could not be installed", &e);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ tray
 
 /// A red record dot, drawn at runtime so the exe needs no icon file.
@@ -181,7 +238,7 @@ unsafe fn tray_add(hwnd: HWND) {
         hIcon: HICON(ICON.load(Ordering::Relaxed) as *mut _),
         ..Default::default()
     };
-    for (i, u) in "clip-a-pc  (Alt+C saves a clip)".encode_utf16().take(127).enumerate() {
+    for (i, u) in format!("clip-a-pc {VERSION}  (Alt+C saves a clip)").encode_utf16().take(127).enumerate() {
         nid.szTip[i] = u;
     }
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
@@ -210,6 +267,9 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open clips folder"));
     let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    if let Some(v) = UPDATE_READY.lock().unwrap().clone() {
+        let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, &HSTRING::from(format!("Restart to update to {v}")));
+    }
     let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
@@ -226,6 +286,7 @@ unsafe fn show_menu(hwnd: HWND) {
             open_path(hwnd, &dir);
         }
         ID_LOG => open_path(hwnd, &log_path()),
+        ID_UPDATE => apply_update(hwnd),
         ID_QUIT => {
             let _ = DestroyWindow(hwnd);
         }
@@ -264,6 +325,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             apply_pending(hwnd);
             LRESULT(0)
         }
+        WM_APP_APPLY_UPDATE => {
+            apply_update(hwnd);
+            LRESULT(0)
+        }
         WM_APP_QUIT => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -291,17 +356,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version") {
+        return; // used by the updater to check a download starts at all
+    }
+    let after_update = args.iter().any(|a| a == "--after-update");
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        // one copy at a time
-        let _mutex = CreateMutexW(None, true, w!("Local\\clip-a-pc-single-instance"));
+        // one copy at a time. After an update the old copy is still shutting down, so wait for it.
+        let mut _mutex = CreateMutexW(None, true, w!("Local\\clip-a-pc-single-instance"));
+        if after_update {
+            for _ in 0..75 {
+                if GetLastError() != ERROR_ALREADY_EXISTS {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                _mutex = CreateMutexW(None, true, w!("Local\\clip-a-pc-single-instance"));
+            }
+        }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             MessageBoxW(None, w!("clip-a-pc is already running. Look for its icon near the clock."), w!("clip-a-pc"), MB_OK | MB_ICONINFORMATION);
             return;
         }
         trim();
         std::panic::set_hook(Box::new(|info| log(&format!("crash: {info}"))));
-        log("clip-a-pc started");
+        log(&format!("clip-a-pc {VERSION} started{}", if after_update { " (after an update)" } else { "" }));
         toast::register();
 
         let hinst = GetModuleHandleW(None).unwrap_or_default();
@@ -338,6 +416,8 @@ pub fn run() {
                 settings_ui::open(hwnd, true, Config::default(), false);
             }
         }
+
+        spawn_updater(hwnd.0 as isize);
 
         // test helper: save one clip after N seconds, then quit
         if let Some(after) = arg_value(&args, "--autosave").and_then(|v| v.parse::<u64>().ok()) {

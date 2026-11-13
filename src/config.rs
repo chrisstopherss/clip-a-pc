@@ -26,11 +26,13 @@ pub struct Config {
     /// Empty means the primary monitor.
     pub monitor: String,
     pub mic_gain: f32,
+    /// Check GitHub for a newer release and install it.
+    pub auto_update: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { duration_secs: DEFAULT_DURATION_SECS, monitor: String::new(), mic_gain: 1.0 }
+        Self { duration_secs: DEFAULT_DURATION_SECS, monitor: String::new(), mic_gain: 1.0, auto_update: true }
     }
 }
 
@@ -53,6 +55,7 @@ impl Config {
                     }
                 }
                 "monitor" => c.monitor = v.to_string(),
+                "auto_update" => c.auto_update = !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"),
                 "mic_volume" => {
                     if let Ok(g) = v.parse::<f32>() {
                         if g.is_finite() {
@@ -68,8 +71,8 @@ impl Config {
 
     pub fn to_text(&self) -> String {
         format!(
-            "# clip-a-pc settings\nclip_seconds = {}\nmonitor = {}\nmic_volume = {}\n",
-            self.duration_secs, self.monitor, self.mic_gain
+            "# clip-a-pc settings\nclip_seconds = {}\nmonitor = {}\nmic_volume = {}\nauto_update = {}\n",
+            self.duration_secs, self.monitor, self.mic_gain, self.auto_update
         )
     }
 }
@@ -100,7 +103,7 @@ mod tests {
 
     #[test]
     fn config_round_trips() {
-        let c = Config { duration_secs: 90, monitor: "\\\\.\\DISPLAY2".into(), mic_gain: 2.0 };
+        let c = Config { duration_secs: 90, monitor: "\\\\.\\DISPLAY2".into(), mic_gain: 2.0, auto_update: false };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
 
@@ -121,5 +124,14 @@ mod tests {
     #[test]
     fn mic_gains_are_sane() {
         assert!(MIC_GAINS.contains(&1.0));
+    }
+
+    #[test]
+    fn auto_update_defaults_on_and_can_be_turned_off() {
+        assert!(Config::default().auto_update);
+        assert!(Config::parse("auto_update = true").auto_update);
+        assert!(!Config::parse("auto_update = false").auto_update);
+        assert!(!Config::parse("auto_update = 0").auto_update);
+        assert!(Config::parse("auto_update = banana").auto_update);
     }
 }

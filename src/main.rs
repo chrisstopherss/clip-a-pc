@@ -6,6 +6,8 @@ mod h264;
 mod mixer;
 mod mp4;
 mod ring;
+mod sha256;
+mod update;
 
 #[cfg(windows)]
 mod win;

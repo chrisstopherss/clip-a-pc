@@ -6,5 +6,6 @@ pub mod log;
 pub mod settings_ui;
 pub mod store;
 pub mod toast;
+pub mod updater;
 pub mod util;
 pub mod video;

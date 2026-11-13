@@ -11,6 +11,20 @@ No dashboard, no account, no uploads. It sits in the tray and stays out of the w
 Early development. It records and saves clips, but it has only been tested on
 one machine so far (Windows 11, NVIDIA GPU).
 
+## Install
+
+Download `clip-a-pc.exe` from the [latest release](https://github.com/chrisstopherss/clip-a-pc/releases/latest)
+and run it. There is nothing to install or unzip.
+
+The app updates itself: it checks for a newer release shortly after it starts and
+every few hours after that, verifies the download against its published SHA-256,
+and installs it. The first check after launch installs straight away. A check made
+while the app has been running waits for you to choose "Restart to update" in the
+tray menu, so a restart never throws away footage you still want. You can turn
+updates off in settings.
+
+The exe is not code signed yet, so Windows SmartScreen may warn the first time.
+
 ## Use
 
 1. Run `clip-a-pc.exe`. On first run pick a monitor and a clip length.
