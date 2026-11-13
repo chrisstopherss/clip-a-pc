@@ -1,9 +1,9 @@
 name: release
 
+# Run from the Actions tab (or by the maintainer's tooling). The release is named
+# after the version in Cargo.toml, so bump that first.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,12 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Tag must match the version in Cargo.toml
+      - name: Work out the version
+        id: ver
         shell: bash
         run: |
           v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if this version is already released
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "${{ steps.ver.outputs.tag }} already exists. Bump the version in Cargo.toml first."
             exit 1
           fi
 
@@ -40,8 +48,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "${{ steps.ver.outputs.tag }}" \
             target/release/clip-a-pc.exe \
             target/release/clip-a-pc.exe.sha256 \
-            --title "$GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.ver.outputs.tag }}" \
             --notes-file RELEASE_NOTES.md
