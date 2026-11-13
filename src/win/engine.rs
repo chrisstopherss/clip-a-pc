@@ -18,13 +18,12 @@ use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use super::util::{timestamp_name, videos_dir};
+use crate::config::Quality;
 use crate::mp4::{write_mp4, AudioParams, VideoParams};
 use crate::ring::{Ring, Track};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-/// Ring bytes per second of buffer: a bit above the 5 Mbps average video rate.
-const RING_BYTES_PER_SEC: usize = 800_000;
 /// A clip starts on a keyframe (one per second), so the buffer keeps this much extra.
 const EXTRA_SECS: u32 = 2;
 
@@ -48,6 +47,7 @@ pub struct EngineCfg {
     pub secs: u32,
     pub monitor: usize,
     pub mic_gain: f32,
+    pub quality: Quality,
 }
 
 pub struct Saved {
@@ -63,6 +63,7 @@ pub struct Engine {
     threads: Mutex<Vec<JoinHandle<()>>>,
     pub frames: Arc<AtomicU64>,
     pub secs: u32,
+    pub quality: Quality,
     pub ring_capacity: usize,
 }
 
@@ -73,7 +74,7 @@ impl Engine {
             MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
             timeBeginPeriod(1);
         }
-        let capacity = (cfg.secs + EXTRA_SECS) as usize * RING_BYTES_PER_SEC;
+        let capacity = (cfg.secs + EXTRA_SECS) as usize * cfg.quality.ring_bytes_per_sec();
         let ring = Arc::new(Mutex::new(Ring::new(capacity, (cfg.secs + EXTRA_SECS) as f64)));
         let shared = Arc::new(Shared::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -108,10 +109,10 @@ impl Engine {
         }
         {
             let (tx, shared, stop, frames) = (tx.clone(), shared.clone(), stop.clone(), frames.clone());
-            let monitor = cfg.monitor;
+            let (monitor, quality) = (cfg.monitor, cfg.quality);
             threads.push(std::thread::spawn(move || {
                 unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
-                if let Err(e) = super::video::run(monitor, tx, shared, stop, frames) {
+                if let Err(e) = super::video::run(monitor, quality, tx, shared, stop, frames) {
                     super::log::log(&format!("video capture stopped for good: {e}"));
                 }
             }));
@@ -125,7 +126,7 @@ impl Engine {
                 }
             }));
         }
-        Ok(Engine { ring, shared, stop, threads: Mutex::new(threads), frames, secs: cfg.secs, ring_capacity: capacity })
+        Ok(Engine { ring, shared, stop, threads: Mutex::new(threads), frames, secs: cfg.secs, quality: cfg.quality, ring_capacity: capacity })
     }
 
     /// (buffered seconds of video, bytes used)
@@ -149,7 +150,7 @@ impl Engine {
             let ring = self.ring.lock().unwrap();
             let clip = ring.select(self.secs as f64).ok_or("no keyframe buffered yet, try again in a second")?;
             let last = clip.video.last().map(|e| e.pts).unwrap_or(clip.start_pts);
-            seconds = (last - clip.start_pts) as f64 / 1e7 + 1.0 / 30.0;
+            seconds = (last - clip.start_pts) as f64 / 1e7 + 1.0 / self.quality.fps() as f64;
             let mut w = BufWriter::with_capacity(1 << 20, File::create(&part)?);
             write_mp4(&mut w, &ring, &clip, &video, audio.as_ref())?;
             w.flush()?;

@@ -61,10 +61,10 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
 fn start_engine(cfg: &Config) -> Option<Arc<Engine>> {
     let monitors = list_monitors();
     let idx = monitors.iter().position(|m| m.device_name == cfg.monitor).unwrap_or(0);
-    match Engine::start(EngineCfg { secs: cfg.duration_secs, monitor: idx, mic_gain: cfg.mic_gain }) {
+    match Engine::start(EngineCfg { secs: cfg.duration_secs, monitor: idx, mic_gain: cfg.mic_gain, quality: cfg.quality }) {
         Ok(e) => {
             let e = Arc::new(e);
-            log(&format!("recording started: {} s clips, monitor {idx}, mic {}x", cfg.duration_secs, cfg.mic_gain));
+            log(&format!("recording started: {} s clips at {}, monitor {idx}, mic {}x", cfg.duration_secs, cfg.quality.label(), cfg.mic_gain));
             let watcher = e.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(3));

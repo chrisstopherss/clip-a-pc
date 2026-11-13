@@ -29,17 +29,12 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use super::engine::{Msg, Shared};
 use super::h264enc::{hardware_encoders, MftEncoder};
 use super::util::qpc_now_100ns;
+use crate::config::Quality;
 use crate::h264::annexb_to_avcc;
 use crate::mp4::VideoParams;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub const FPS: u32 = 30;
-const FRAME_100NS: i64 = 10_000_000 / FPS as i64;
-const MAX_W: u32 = 1280;
-const MAX_H: u32 = 720;
-const MEAN_BPS: u32 = 5_000_000;
-const MAX_BPS: u32 = 7_000_000;
 const POOL: usize = 5;
 
 #[derive(Clone, Debug)]
@@ -96,10 +91,13 @@ pub struct Pipeline {
     pub adapter: String,
     pub encoder: String,
     pub dropped: u64,
+    q: Quality,
 }
 
 impl Pipeline {
-    pub fn new(monitor_index: usize) -> Res<Self> {
+    pub fn new(monitor_index: usize, q: Quality) -> Res<Self> {
+        let fps = q.fps();
+        let (max_w, max_h) = q.max_size();
         let monitors = list_monitors();
         let mon = monitors.get(monitor_index).or_else(|| monitors.first()).ok_or("no monitors found")?;
 
@@ -131,7 +129,7 @@ impl Pipeline {
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(HMONITOR(mon.handle as *mut _))? };
         let size = item.Size()?;
         let (src_w, src_h) = (size.Width as u32, size.Height as u32);
-        let scale = (MAX_W as f64 / src_w as f64).min(MAX_H as f64 / src_h as f64).min(1.0);
+        let scale = (max_w as f64 / src_w as f64).min(max_h as f64 / src_h as f64).min(1.0);
         let out_w = ((src_w as f64 * scale) as u32) & !1;
         let out_h = ((src_h as f64 * scale) as u32) & !1;
 
@@ -169,10 +167,10 @@ impl Pipeline {
         let vctx: ID3D11VideoContext = ctx.cast()?;
         let cd = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: DXGI_RATIONAL { Numerator: FPS, Denominator: 1 },
+            InputFrameRate: DXGI_RATIONAL { Numerator: fps, Denominator: 1 },
             InputWidth: src_w,
             InputHeight: src_h,
-            OutputFrameRate: DXGI_RATIONAL { Numerator: FPS, Denominator: 1 },
+            OutputFrameRate: DXGI_RATIONAL { Numerator: fps, Denominator: 1 },
             OutputWidth: out_w,
             OutputHeight: out_h,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
@@ -227,9 +225,9 @@ impl Pipeline {
             })
             .or_else(|| encoders.first())
             .ok_or("no hardware H.264 encoder found")?;
-        let enc = MftEncoder::new(act, name.clone(), &mgr, out_w, out_h, FPS, MEAN_BPS, MAX_BPS)?;
+        let enc = MftEncoder::new(act, name.clone(), &mgr, out_w, out_h, fps, q.mean_bps(), q.max_bps())?;
 
-        Ok(Self { latest, session, pool, vdev, vctx, venum, vproc, nv12, enc, _mgr: mgr, lost, src_size: (src_w, src_h), out_w, out_h, adapter, encoder: name.clone(), dropped: 0 })
+        Ok(Self { latest, session, pool, vdev, vctx, venum, vproc, nv12, enc, _mgr: mgr, lost, src_size: (src_w, src_h), out_w, out_h, adapter, encoder: name.clone(), dropped: 0, q })
     }
 
     pub fn has_frame(&self) -> bool {
@@ -271,7 +269,7 @@ impl Pipeline {
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buf)?;
             sample.SetSampleTime(pts)?;
-            sample.SetSampleDuration(FRAME_100NS)?;
+            sample.SetSampleDuration(10_000_000 / self.q.fps() as i64)?;
             if !self.enc.feed(&sample)? {
                 self.dropped += 1;
             }
@@ -290,9 +288,11 @@ impl Pipeline {
     }
 }
 
-fn run_once(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
-    let mut pipe = Pipeline::new(monitor)?;
-    *shared.video_info.lock().unwrap() = format!("{} on {} ({}x{} at {} fps)", pipe.encoder, pipe.adapter, pipe.out_w, pipe.out_h, FPS);
+fn run_once(monitor: usize, q: Quality, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
+    let fps = q.fps();
+    let frame_100ns = 10_000_000 / fps as i64;
+    let mut pipe = Pipeline::new(monitor, q)?;
+    *shared.video_info.lock().unwrap() = format!("{} on {} ({}x{} at {} fps)", pipe.encoder, pipe.adapter, pipe.out_w, pipe.out_h, fps);
 
     let wait = Instant::now();
     while !pipe.has_frame() {
@@ -311,7 +311,7 @@ fn run_once(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<Atom
     let mut n = 0u64;
     let mut sps_pps: Option<(Vec<u8>, Vec<u8>)> = None;
     while !stop.load(Ordering::Relaxed) {
-        let due = start + Duration::from_nanos(n * 1_000_000_000 / FPS as u64);
+        let due = start + Duration::from_nanos(n * 1_000_000_000 / fps as u64);
         let now = Instant::now();
         if due > now {
             std::thread::sleep(due - now);
@@ -321,7 +321,7 @@ fn run_once(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<Atom
             start_pts = qpc_now_100ns();
             n = 0;
         }
-        pipe.submit(n, start_pts + n as i64 * FRAME_100NS)?;
+        pipe.submit(n, start_pts + n as i64 * frame_100ns)?;
         frames.fetch_add(1, Ordering::Relaxed);
         n += 1;
 
@@ -346,10 +346,10 @@ fn run_once(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<Atom
 
 /// Runs until `stop` is set. If capture fails (display change, GPU reset, sleep)
 /// it clears the buffer, waits a moment and starts again.
-pub fn run(monitor: usize, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
+pub fn run(monitor: usize, q: Quality, tx: Sender<Msg>, shared: Arc<Shared>, stop: Arc<AtomicBool>, frames: Arc<AtomicU64>) -> Res<()> {
     let mut last_err = String::new();
     while !stop.load(Ordering::Relaxed) {
-        match run_once(monitor, tx.clone(), shared.clone(), stop.clone(), frames.clone()) {
+        match run_once(monitor, q, tx.clone(), shared.clone(), stop.clone(), frames.clone()) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let msg = e.to_string();

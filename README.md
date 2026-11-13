@@ -35,9 +35,12 @@ Right-click the tray icon for settings, the clips folder, and quit.
 
 ## What it records
 
-- 720p at 30 fps, hardware H.264 (NVIDIA, AMD or Intel)
+- 720p at 30 fps (default) or 1080p at 60 fps, hardware H.264 (NVIDIA, AMD or Intel)
 - Desktop audio from every app, plus your default microphone, in one track
 - Clip lengths of 15, 30, 45, 60, 90 or 120 seconds
+
+1080p60 uses roughly twice the bitrate, so it needs a bigger buffer. Settings shows
+an estimate of the memory use for the length and quality you pick.
 
 Memory stays low because it never stores raw frames. Only the compressed video
 sits in a fixed-size buffer, and a clip is cut straight from that buffer with no

@@ -12,7 +12,7 @@ use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, GetSy
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::video::{list_monitors, MonitorInfo};
-use crate::config::{Config, DURATIONS_SECS, MIC_GAINS};
+use crate::config::{estimate_memory_mb, Config, Quality, DURATIONS_SECS, MIC_GAINS};
 
 pub const WM_APP_SETTINGS_DONE: u32 = WM_APP + 2;
 pub const WM_APP_QUIT: u32 = WM_APP + 3;
@@ -34,6 +34,8 @@ const ID_LENGTH: i32 = 102;
 const ID_MIC: i32 = 103;
 const ID_AUTOSTART: i32 = 104;
 const ID_UPDATES: i32 = 105;
+const ID_QUALITY: i32 = 106;
+const CBN_SELCHANGE_CODE: usize = 1;
 
 struct Ui {
     main: isize,
@@ -43,6 +45,8 @@ struct Ui {
     initial_autostart: bool,
     monitor: HWND,
     length: HWND,
+    quality: HWND,
+    estimate: HWND,
     mic: HWND,
     autostart: HWND,
     updates: HWND,
@@ -79,6 +83,8 @@ pub fn open(main: HWND, first_run: bool, current: Config, autostart: bool) {
             initial_autostart: autostart,
             monitor: HWND::default(),
             length: HWND::default(),
+            quality: HWND::default(),
+            estimate: HWND::default(),
             mic: HWND::default(),
             autostart: HWND::default(),
             updates: HWND::default(),
@@ -163,12 +169,15 @@ unsafe fn build(hwnd: HWND, ui: &mut Ui) {
     ui.monitor = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 62, 234, 200), ID_MONITOR, dpi, ui.font);
     child(hwnd, w!("STATIC"), "Clip length", 0, (16, 102, 130, 20), 0, dpi, ui.font);
     ui.length = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 98, 234, 200), ID_LENGTH, dpi, ui.font);
-    child(hwnd, w!("STATIC"), "Microphone volume", 0, (16, 138, 130, 20), 0, dpi, ui.font);
-    ui.mic = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 134, 234, 200), ID_MIC, dpi, ui.font);
-    ui.autostart = child(hwnd, w!("BUTTON"), "Start with Windows", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 176, 368, 22), ID_AUTOSTART, dpi, ui.font);
-    ui.updates = child(hwnd, w!("BUTTON"), "Update automatically", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 204, 368, 22), ID_UPDATES, dpi, ui.font);
-    child(hwnd, w!("BUTTON"), "Save", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP.0, (210, 248, 84, 28), ID_OK, dpi, ui.font);
-    child(hwnd, w!("BUTTON"), "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP.0, (300, 248, 84, 28), ID_CANCEL, dpi, ui.font);
+    child(hwnd, w!("STATIC"), "Quality", 0, (16, 138, 130, 20), 0, dpi, ui.font);
+    ui.quality = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 134, 234, 200), ID_QUALITY, dpi, ui.font);
+    child(hwnd, w!("STATIC"), "Microphone volume", 0, (16, 174, 130, 20), 0, dpi, ui.font);
+    ui.mic = child(hwnd, w!("COMBOBOX"), "", (CBS_DROPDOWNLIST as u32) | WS_TABSTOP.0 | WS_VSCROLL.0, (150, 170, 234, 200), ID_MIC, dpi, ui.font);
+    ui.estimate = child(hwnd, w!("STATIC"), "", 0, (16, 208, 368, 20), 0, dpi, ui.font);
+    ui.autostart = child(hwnd, w!("BUTTON"), "Start with Windows", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 238, 368, 22), ID_AUTOSTART, dpi, ui.font);
+    ui.updates = child(hwnd, w!("BUTTON"), "Update automatically", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP.0, (16, 264, 368, 22), ID_UPDATES, dpi, ui.font);
+    child(hwnd, w!("BUTTON"), "Save", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP.0, (210, 306, 84, 28), ID_OK, dpi, ui.font);
+    child(hwnd, w!("BUTTON"), "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP.0, (300, 306, 84, 28), ID_CANCEL, dpi, ui.font);
 
     for m in &ui.monitors {
         let n = list_index_label(m);
@@ -182,6 +191,12 @@ unsafe fn build(hwnd: HWND, ui: &mut Ui) {
     }
     let sel = DURATIONS_SECS.iter().position(|&d| d == ui.initial.duration_secs).unwrap_or(1);
     SendMessageW(ui.length, CB_SETCURSEL, Some(WPARAM(sel)), None);
+
+    for q in Quality::ALL {
+        add_item(ui.quality, q.label());
+    }
+    let sel = Quality::ALL.iter().position(|&q| q == ui.initial.quality).unwrap_or(0);
+    SendMessageW(ui.quality, CB_SETCURSEL, Some(WPARAM(sel)), None);
 
     for g in MIC_GAINS {
         add_item(ui.mic, &format!("{}%", (g * 100.0).round() as i32));
@@ -199,13 +214,29 @@ unsafe fn build(hwnd: HWND, ui: &mut Ui) {
     if ui.initial.auto_update {
         SendMessageW(ui.updates, BM_SETCHECK, Some(WPARAM(1)), None);
     }
+    update_estimate(ui);
 
-    // size the window around a 400 x 292 client area and centre it on screen
-    let mut r = RECT { left: 0, top: 0, right: scaled(400, dpi), bottom: scaled(292, dpi) };
+    // size the window around a 400 x 350 client area and centre it on screen
+    let mut r = RECT { left: 0, top: 0, right: scaled(400, dpi), bottom: scaled(350, dpi) };
     let _ = AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, false, WS_EX_APPWINDOW, dpi);
     let (w, h) = (r.right - r.left, r.bottom - r.top);
     let (sw, sh) = (GetSystemMetricsForDpi(SM_CXSCREEN, dpi), GetSystemMetricsForDpi(SM_CYSCREEN, dpi));
     let _ = SetWindowPos(hwnd, None, (sw - w) / 2, (sh - h) / 2, w, h, SWP_NOZORDER);
+}
+
+fn chosen(ui: &Ui) -> (u32, Quality) {
+    let pick = |c: HWND| unsafe { SendMessageW(c, CB_GETCURSEL, None, None).0.max(0) as usize };
+    (
+        DURATIONS_SECS[pick(ui.length).min(DURATIONS_SECS.len() - 1)],
+        Quality::ALL[pick(ui.quality).min(Quality::ALL.len() - 1)],
+    )
+}
+
+/// Show the rough memory cost of the current choices.
+unsafe fn update_estimate(ui: &Ui) {
+    let (secs, q) = chosen(ui);
+    let text = format!("Estimated memory use: about {} MB", estimate_memory_mb(secs, q));
+    let _ = SetWindowTextW(ui.estimate, &HSTRING::from(text));
 }
 
 fn list_index_label(m: &MonitorInfo) -> String {
@@ -219,6 +250,7 @@ unsafe fn finish(hwnd: HWND, ui: &Ui, save: bool) {
             duration_secs: DURATIONS_SECS[sel(ui.length).min(DURATIONS_SECS.len() - 1)],
             monitor: ui.monitors.get(sel(ui.monitor)).map(|m| m.device_name.clone()).unwrap_or_default(),
             mic_gain: MIC_GAINS[sel(ui.mic).min(MIC_GAINS.len() - 1)],
+            quality: Quality::ALL[sel(ui.quality).min(Quality::ALL.len() - 1)],
             auto_update: SendMessageW(ui.updates, BM_GETCHECK, None, None).0 == 1,
         };
         let autostart = SendMessageW(ui.autostart, BM_GETCHECK, None, None).0 == 1;
@@ -247,9 +279,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             LRESULT(0)
         }
         WM_COMMAND => {
+            let code = (wp.0 >> 16) & 0xFFFF;
             match (wp.0 & 0xFFFF) as i32 {
                 ID_OK => finish(hwnd, ui, true),
                 ID_CANCEL => finish(hwnd, ui, false),
+                ID_LENGTH | ID_QUALITY if code == CBN_SELCHANGE_CODE => update_estimate(ui),
                 _ => {}
             }
             LRESULT(0)
