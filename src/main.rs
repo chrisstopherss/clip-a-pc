@@ -1,21 +1,10 @@
-#![allow(dead_code)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
-
-mod config;
-mod h264;
-mod livemp4;
-mod mixer;
-mod mp4;
-mod ring;
-mod sha256;
-mod update;
-
-#[cfg(windows)]
-mod win;
 
 fn main() {
     #[cfg(windows)]
-    win::app::run();
-    #[cfg(not(windows))]
-    println!("clip-a-pc only runs on Windows");
+    clip_a_pc::win::app::run();
+    #[cfg(target_os = "macos")]
+    clip_a_pc::mac::app::run();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    println!("clip-a-pc runs on Windows and macOS");
 }
