@@ -8,7 +8,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -36,3 +36,22 @@ jobs:
           path: |
             target/release/examples/spike_a.exe
             target/release/examples/spike_b.exe
+      - name: Build Mac spike (Apple Silicon and Intel in one file)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --example mac_spike_a --target aarch64-apple-darwin
+          cargo build --release --example mac_spike_a --target x86_64-apple-darwin
+          mkdir -p out
+          lipo -create -output out/mac_spike_a \
+            target/aarch64-apple-darwin/release/examples/mac_spike_a \
+            target/x86_64-apple-darwin/release/examples/mac_spike_a
+          codesign --force --sign - out/mac_spike_a
+      - name: Upload Mac spike
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac_spike_a
+          path: out/mac_spike_a
