@@ -29,6 +29,7 @@ version = "0.2.0"
 dependencies = [
  "block2",
  "embed-manifest",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
