@@ -78,3 +78,30 @@ pub fn memory_mb() -> f64 {
     let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
     out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()).map(|kb| kb / 1024.0).unwrap_or(0.0)
 }
+
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A notification-centre banner. Uses the system's own tool so it needs no extra permission setup.
+pub fn notify(title: &str, body: &str) {
+    let script = format!("display notification \"{}\" with title \"{}\"", applescript_escape(body), applescript_escape(title));
+    let _ = std::process::Command::new("/usr/bin/osascript").args(["-e", &script]).spawn();
+}
+
+/// Open a file, folder or URL with the default app.
+pub fn open(target: &str) {
+    let _ = std::process::Command::new("/usr/bin/open").arg(target).spawn();
+}
+
+/// The Screen Recording page of System Settings.
+pub fn open_screen_recording_settings() {
+    open("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
+}
+
+/// The .app folder this program is running from, if it is running from one.
+pub fn bundle_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let b = exe.ancestors().nth(3)?.to_path_buf();
+    (b.extension().map(|e| e == "app").unwrap_or(false)).then_some(b)
+}

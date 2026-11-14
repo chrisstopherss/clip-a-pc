@@ -1,7 +1,7 @@
 name: mac-test
 
-# Publishes the Mac test program as a pre-release called "mac-test". It is a pre-release on
-# purpose: the Windows updater reads the latest normal release and must never see this one.
+# Publishes the Mac app and the two Mac test programs as a pre-release called "mac-test". It is a
+# pre-release on purpose: the updaters read the latest normal release and must never see this one.
 on:
   workflow_dispatch:
 
@@ -14,25 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (Apple Silicon and Intel in one file)
+      - name: Build the app
+        run: scripts/build-mac-app.sh
+
+      - name: Build the test programs (Apple Silicon and Intel in one file each)
         env:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release --example mac_spike_a --target aarch64-apple-darwin
-          cargo build --release --example mac_spike_a --target x86_64-apple-darwin
-          mkdir -p out
-          lipo -create -output out/mac_spike_a \
-            target/aarch64-apple-darwin/release/examples/mac_spike_a \
-            target/x86_64-apple-darwin/release/examples/mac_spike_a
-          codesign --force --sign - out/mac_spike_a
+          for p in mac_spike_a mac_spike_b; do
+            cargo build --release --example $p --target aarch64-apple-darwin
+            cargo build --release --example $p --target x86_64-apple-darwin
+            lipo -create -output out/$p \
+              target/aarch64-apple-darwin/release/examples/$p \
+              target/x86_64-apple-darwin/release/examples/$p
+            codesign --force --sign - out/$p
+          done
 
       - name: Publish pre-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release delete mac-test --cleanup-tag --yes || true
-          gh release create mac-test out/mac_spike_a \
+          gh release create mac-test out/clip-a-pc-mac.zip out/mac_spike_a out/mac_spike_b \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Mac test build" \

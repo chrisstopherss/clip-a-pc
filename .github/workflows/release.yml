@@ -1,7 +1,8 @@
 name: release
 
-# Run from the Actions tab (or by the maintainer's tooling). The release is named
-# after the version in Cargo.toml, so bump that first.
+# Run from the Actions tab. The release is named after the version in Cargo.toml, so bump that first.
+# It carries the Windows exe and the Mac app. A problem building the Mac app does not stop the
+# Windows release.
 on:
   workflow_dispatch:
 
@@ -9,20 +10,17 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-latest
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Work out the version
-        id: ver
-        shell: bash
+      - id: ver
         run: |
           v=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "tag=v$v" >> "$GITHUB_OUTPUT"
-
       - name: Stop if this version is already released
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -31,26 +29,59 @@ jobs:
             exit 1
           fi
 
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Test
         run: cargo test
-
       - name: Build
         run: cargo build --release
-
       - name: Checksum
         shell: pwsh
         run: |
           $h = (Get-FileHash target/release/clip-a-pc.exe -Algorithm SHA256).Hash.ToLower()
           "$h  clip-a-pc.exe" | Out-File -FilePath target/release/clip-a-pc.exe.sha256 -Encoding ascii -NoNewline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            target/release/clip-a-pc.exe
+            target/release/clip-a-pc.exe.sha256
 
+  mac:
+    needs: check
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Mac app
+        run: scripts/build-mac-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-mac
+          path: |
+            out/clip-a-pc-mac.zip
+            out/clip-a-pc-mac.zip.sha256
+
+  publish:
+    needs: [check, windows, mac]
+    if: ${{ always() && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
       - name: Publish release
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.ver.outputs.tag }}" \
-            target/release/clip-a-pc.exe \
-            target/release/clip-a-pc.exe.sha256 \
+          ls -l dist
+          gh release create "${{ needs.check.outputs.tag }}" dist/* \
             --target "$GITHUB_SHA" \
-            --title "${{ steps.ver.outputs.tag }}" \
+            --title "${{ needs.check.outputs.tag }}" \
             --notes-file RELEASE_NOTES.md

@@ -1,6 +1,6 @@
 # clip-a-pc
 
-A small background clipper for Windows. It keeps the last few seconds of your
+A small background clipper for Windows and Mac. It keeps the last few seconds of your
 screen in memory, and when you press Alt+C it saves them as an MP4 with your
 desktop audio and microphone.
 
@@ -8,8 +8,8 @@ No dashboard, no account, no uploads. It sits in the tray and stays out of the w
 
 ## Status
 
-Early development. It records and saves clips, but it has only been tested on
-one machine so far (Windows 11, NVIDIA GPU).
+Early development. On Windows it records and saves clips, but it has only been tested on
+one machine so far (Windows 11, NVIDIA GPU). The Mac version has not been tested on a Mac yet.
 
 ## Install
 
@@ -61,9 +61,33 @@ Memory stays low because it never stores raw frames. Only the compressed video
 sits in a fixed-size buffer, and a clip is cut straight from that buffer with no
 re-encoding.
 
+## Mac
+
+The Mac version is new and has had very little testing. It needs macOS 15 or newer, on
+Apple Silicon or Intel.
+
+1. Download `clip-a-pc-mac.zip` from the releases page, unzip it, and drag `clip-a-pc.app`
+   to Applications.
+2. The app is not signed, so macOS blocks it the first time. Clear the flag once in Terminal:
+   `xattr -dr com.apple.quarantine /Applications/clip-a-pc.app`
+3. Open it. It lives in the menu bar. macOS asks for Screen Recording and Microphone
+   permission the first time.
+
+| Shortcut | What it does |
+|---|---|
+| Control+Option+C | Save the last few seconds |
+| Control+Option+X | Pop up a menu and pick how many seconds to save |
+| Control+Option+V | Start recording, and again to stop and save |
+
+Control is part of the shortcuts because macOS 15 blocks global shortcuts that use only
+Option. Clips and recordings go to `~/Movies/clip-a-pc`. Settings and the log are in
+`~/Library/Application Support/clip-a-pc`. Updates replace the app in place. Because the app
+is not signed with a paid Apple certificate, macOS may ask you to allow Screen Recording
+again after an update.
+
 ## Requirements
 
-Windows 11 and a GPU with a hardware H.264 encoder.
+Windows 11 or macOS 15, and a GPU with a hardware H.264 encoder (every Mac has one).
 
 ## Files
 

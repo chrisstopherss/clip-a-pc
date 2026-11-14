@@ -1,2 +1,10 @@
+pub mod aac;
 pub mod app;
+pub mod audio;
+pub mod capture;
+pub mod engine;
+pub mod settings;
+pub mod store;
+pub mod updater;
 pub mod util;
+pub mod video;

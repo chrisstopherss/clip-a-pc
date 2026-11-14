@@ -21,6 +21,10 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-screen-capture-kit = "0.3"
 objc2-video-toolbox = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-audio-toolbox = "0.3"
+global-hotkey = "0.10"
+dispatch2 = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.27"
